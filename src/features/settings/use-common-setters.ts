@@ -3,13 +3,13 @@
  * This eliminates duplication for truly identical setter patterns
  */
 
-import type { ToastType } from '@/components/feedback/Toast.svelte';
 import type { InboxSetters } from '@/features/inbox/inbox-actions';
 import type { ExportSetters } from '@/features/inbox/inbox-export';
 import type { LoginSetters } from '@/features/login-info/login-actions';
 import type { QRSetters } from '@/features/qr/qr-actions';
 import type { SettingsSetters } from '@/features/settings/settings-actions';
 import type { ContrastLevel, ThemeMode, ThemeSetters } from '@/features/theme/theme-actions';
+import type { ToastType } from '@/ui/blocks/feedback/Toast.svelte';
 import type {
   Account,
   CredentialsHistoryItem,
@@ -20,9 +20,9 @@ import type {
 
 interface CommonSettersConfig {
   // Inbox state setters
-  setAccounts: (value: Account[]) => void;
-  setAllInboxes: (value: Account[]) => void;
-  setEmails: (value: Email[]) => void;
+  setAccounts: (value: Account[] | ((prev: Account[]) => Account[])) => void;
+  setAllInboxes: (value: Account[] | ((prev: Account[]) => Account[])) => void;
+  setEmails: (value: Email[] | ((prev: Email[]) => Email[])) => void;
   setLatestOtp: (value: string) => void;
   setLatestOtpSender: (value: string) => void;
   setLatestOtpSenderName: (value: string) => void;
@@ -82,6 +82,7 @@ interface CommonSettersConfig {
 
   // Functions
   loadInboxes: () => Promise<void>;
+  confirmAsync?: (message: string) => Promise<boolean>;
 }
 
 /**
@@ -137,6 +138,7 @@ export function useCommonSetters(config: CommonSettersConfig) {
     setShowToast,
     // Functions
     loadInboxes,
+    confirmAsync,
   } = config;
 
   // Inbox setters
@@ -181,6 +183,7 @@ export function useCommonSetters(config: CommonSettersConfig) {
     setDefaultDomain,
     setShowToast,
     loadInboxes,
+    confirmAsync,
   };
 
   // Theme setters

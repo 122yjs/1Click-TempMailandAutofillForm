@@ -16,6 +16,9 @@ pre-commit:
     check-translations:
       run: bun run check-translations
 
+    check-hardcoded-english:
+      run: bun run check-hardcoded-english
+
     typecheck:
       run: bun run typecheck
 

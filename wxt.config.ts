@@ -43,13 +43,13 @@ const rawVersion = process.env.VERSION_OVERRIDE?.replace(/^v/, '') || pkg.versio
 function sanitizeVersionForManifest(version: string): string {
   const [core = '', pre = ''] = version.split('-', 2);
   const parts = core.split('.').map((p) => Number.parseInt(p, 10));
-  // Strip any non-numeric garbage
-  const clean = parts.filter((n) => Number.isFinite(n) && n >= 0 && n <= 65536);
+  // Strip any non-numeric garbage and clamp to 0-65535
+  const clean = parts.filter((n) => Number.isFinite(n) && n >= 0).map((n) => Math.min(n, 65535));
   if (pre) {
     // Append the pre-release counter as a 4th integer (0-65535)
     const preNum = Number.parseInt(pre.replace(/\D/g, ''), 10);
     if (Number.isFinite(preNum) && clean.length < 4) {
-      clean.push(preNum || 1);
+      clean.push(Math.min(preNum || 1, 65535));
     }
   }
   // Pad to at least 1 integer; truncate to at most 4
@@ -63,6 +63,9 @@ const version = sanitizeVersionForManifest(rawVersion);
 export default defineConfig({
   modules: ['@wxt-dev/module-svelte'],
   vite: () => ({
+    optimizeDeps: {
+      rolldownOptions: {},
+    },
     plugins: [
       tailwindcss(),
       // Treat .jsonc files as JSON so the providers DSL can be commented.
@@ -86,8 +89,13 @@ export default defineConfig({
       },
     },
     build: {
-      // Popup UI + Material styles + locales live in one shell chunk; 800 was noisy.
-      chunkSizeWarningLimit: 1200,
+      // Popup UI + Material styles + locales live in one shell chunk (1.38 MB minified).
+      chunkSizeWarningLimit: 1600,
+      // Content scripts run in an isolated (cross-world) namespace — Chrome cannot
+      // use <link rel="modulepreload"> injected by Vite across worlds, producing
+      // "preload ... is not used because it is a cross-world extension resource
+      // mismatch" console warnings. Disable modulepreload to silence them.
+      modulePreload: false,
     },
   }),
   manifestVersion: 3,
@@ -145,8 +153,15 @@ export default defineConfig({
       'https://alphac.qzz.io/*',
       'https://raceco.dpdns.org/*',
       'https://burner.kiwi/*',
+      ...(process.env.NODE_ENV !== 'production'
+        ? ['http://localhost/*', 'http://127.0.0.1/*']
+        : []),
     ],
     optional_host_permissions: ['<all_urls>'],
+    // optional_host_permissions: <all_urls> is requested only when the user adds a
+    // custom mail-provider instance URL (see instance-manager / MailProviderView).
+    // Content scripts match <all_urls> for autofill/OTP on arbitrary signup pages.
+    // Document this rationale in store listings and ARCHITECTURE.md § Permissions.
     commands: {
       'autofill-form': {
         suggested_key: {
@@ -157,6 +172,20 @@ export default defineConfig({
       },
       'open-autofill-manager': {
         description: 'Open Autofill manager (Profiles & Credentials)',
+      },
+      'quick-generate-inbox': {
+        suggested_key: {
+          default: 'Alt+Shift+N',
+          mac: 'Alt+Shift+N',
+        },
+        description: 'Quick generate new temporary email address',
+      },
+      'copy-latest-otp': {
+        suggested_key: {
+          default: 'Alt+Shift+O',
+          mac: 'Alt+Shift+O',
+        },
+        description: 'Copy the latest OTP code to clipboard',
       },
     },
   },

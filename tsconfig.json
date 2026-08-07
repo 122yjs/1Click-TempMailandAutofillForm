@@ -5,7 +5,13 @@
     "lib": ["ES2020", "DOM", "DOM.Iterable"],
     "moduleResolution": "bundler",
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["./src/*"],
+      "@/ui/*": ["./src/ui/*"],
+      "@/primitives": ["./src/ui/components/primitives/index.ts"],
+      "@/primitives/*": ["./src/ui/components/primitives/*"],
+      "@/composites/*": ["./src/ui/components/composites/*"],
+      "@/blocks/*": ["./src/ui/blocks/*"],
+      "@/views/*": ["./src/ui/views/*"]
     },
     "resolveJsonModule": true,
     "allowJs": true,

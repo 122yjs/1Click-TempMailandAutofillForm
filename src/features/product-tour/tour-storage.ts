@@ -19,6 +19,7 @@ export async function isProductTourCompleted(): Promise<boolean> {
     // Completed for an older version still counts as completed (user can replay)
     return true;
   } catch {
+    /* ignore */
     return false;
   }
 }
@@ -42,6 +43,7 @@ export async function isPendingProductTour(): Promise<boolean> {
     };
     return !!res[PRODUCT_TOUR_PENDING_KEY];
   } catch {
+    /* ignore */
     return false;
   }
 }

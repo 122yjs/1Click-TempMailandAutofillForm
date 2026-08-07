@@ -16,6 +16,7 @@ import type { Account, Analytics, Email, ProviderInstance } from '@/utils/types.
 export type ProviderStorageKey =
   | `customInstances_${string}`
   | `selectedInstance_${string}`
+  | `disabledInstances_${string}`
   | `defaultDomain_${string}`
   | `domainIndex_${string}_${string}`;
 
@@ -59,7 +60,39 @@ export type StorageKey =
   | 'developerSettings'
   | 'faviconCaching'
   | 'emailPreviewEnabled'
-  | 'keybindings';
+  | 'keybindings'
+  | 'clipboardPurgeQueue'
+  | 'clipboardPrivacy'
+  | 'activityEvents'
+  | 'providerConfigOverrides'
+  | 'themeColors'
+  | 'vault_security_config'
+  | 'favicon_success_cache'
+  | 'favicon_error_cache'
+  | 'storageQuotaWarning'
+  | 'connectivityLog'
+  | 'sidePanelOpen'
+  | 'expandedAppState'
+  | 'notificationSnoozeByAddress'
+  | 'marqueeSelectionEnabled'
+  | 'demoMode'
+  | 'onboardingComplete'
+  | 'customNavOrder'
+  | 'toolbarButtonVisibility'
+  | 'showSearchSlashIcon'
+  | 'voiceSearchEnabled'
+  | 'uiDensity'
+  | 'splitPaneCollapsed'
+  | 'splitListWidthPx'
+  | 'pendingProductTour'
+  | 'pendingProductTourAt'
+  | 'productTourCompleted'
+  | 'locale'
+  | 'preferredLanguage'
+  | 'starredEmails'
+  | 'seenEmailIds'
+  | 'lastMessageTimestamps'
+  | 'latestOtp';
 
 /**
  * Build a typed `defaultDomain_<provider>` storage key.
@@ -83,6 +116,15 @@ export function domainIndexKey(
  */
 export function selectedInstanceKey(provider: string): `selectedInstance_${string}` {
   return `selectedInstance_${provider}` as `selectedInstance_${string}`;
+}
+
+/**
+ * Build a typed `disabledInstances_<provider>` storage key.
+ * Holds the blacklist of instance ids excluded from email generation
+ * (all instances enabled when absent/empty).
+ */
+export function disabledInstancesKey(provider: string): `disabledInstances_${string}` {
+  return `disabledInstances_${provider}` as `disabledInstances_${string}`;
 }
 
 /**
@@ -115,6 +157,11 @@ export function isBooleanRecord(value: unknown): value is Record<string, boolean
   return isRecord(value) && Object.values(value).every((entry) => typeof entry === 'boolean');
 }
 
+type AccountWithEncryptedAuth = Account & {
+  __encryptedToken?: string;
+  __encryptedSidToken?: string;
+};
+
 // ---------------------------------------------------------------------------
 // Common typed helpers - eliminate repeated cast boilerplate across the codebase
 // ---------------------------------------------------------------------------
@@ -131,14 +178,18 @@ export async function getInboxes(): Promise<Account[]> {
       try {
         item.token = await decrypt(item.token.slice(6));
       } catch {
-        // Keep as-is if decryption fails (e.g. vault locked)
+        // Vault locked or key unavailable: never expose ciphertext as an auth token.
+        (item as AccountWithEncryptedAuth).__encryptedToken = item.token;
+        item.token = undefined;
       }
     }
     if (item.sidToken?.startsWith('_enc_:')) {
       try {
         item.sidToken = await decrypt(item.sidToken.slice(6));
       } catch {
-        // Keep as-is if decryption fails (e.g. vault locked)
+        // Vault locked or key unavailable: never expose ciphertext as an auth token.
+        (item as AccountWithEncryptedAuth).__encryptedSidToken = item.sidToken;
+        item.sidToken = undefined;
       }
     }
     decryptedInboxes.push(item);
@@ -149,8 +200,26 @@ export async function getInboxes(): Promise<Account[]> {
 /** Persists the inboxes array. */
 export async function setInboxes(inboxes: Account[]): Promise<void> {
   const encryptedInboxes: Account[] = [];
+  const seenIds = new Set<string>();
+  const seenAddrs = new Set<string>();
+
   for (const inbox of inboxes) {
-    const item = { ...inbox };
+    if (!inbox?.id) continue;
+    const addrKey = (inbox.address || '').toLowerCase().trim();
+    if (seenIds.has(inbox.id) || (addrKey && seenAddrs.has(addrKey))) {
+      continue; // Skip duplicate inbox entries
+    }
+    seenIds.add(inbox.id);
+    if (addrKey) seenAddrs.add(addrKey);
+
+    const source = inbox as AccountWithEncryptedAuth;
+    const item = { ...source } as AccountWithEncryptedAuth;
+    if (!item.token && source.__encryptedToken?.startsWith('_enc_:')) {
+      item.token = source.__encryptedToken;
+    }
+    if (!item.sidToken && source.__encryptedSidToken?.startsWith('_enc_:')) {
+      item.sidToken = source.__encryptedSidToken;
+    }
     if (item.token && !item.token.startsWith('_enc_:')) {
       const encrypted = await encrypt(item.token);
       item.token = `_enc_:${encrypted}`;
@@ -159,6 +228,8 @@ export async function setInboxes(inboxes: Account[]): Promise<void> {
       const encrypted = await encrypt(item.sidToken);
       item.sidToken = `_enc_:${encrypted}`;
     }
+    delete item.__encryptedToken;
+    delete item.__encryptedSidToken;
     encryptedInboxes.push(item);
   }
   await browser.storage.local.set({ inboxes: encryptedInboxes });
@@ -227,10 +298,19 @@ export const DEFAULT_ANALYTICS: Analytics = {
 
 /** Returns the analytics object (defaults to DEFAULT_ANALYTICS). */
 export async function getAnalyticsRecord(): Promise<Analytics> {
-  const { analytics = { ...DEFAULT_ANALYTICS } } = (await browser.storage.local.get([
-    'analytics',
-  ])) as { analytics?: Analytics };
-  return analytics;
+  const { analytics } = (await browser.storage.local.get(['analytics'])) as {
+    analytics?: Analytics;
+  };
+  if (analytics) return analytics;
+  // Deep copy to avoid mutating the DEFAULT_ANALYTICS constant
+  return {
+    ...DEFAULT_ANALYTICS,
+    performance: {
+      emailFetchTimes: [...(DEFAULT_ANALYTICS.performance?.emailFetchTimes ?? [])],
+      providerLatency: { ...(DEFAULT_ANALYTICS.performance?.providerLatency ?? {}) },
+      uiRenderTimes: [...(DEFAULT_ANALYTICS.performance?.uiRenderTimes ?? [])],
+    },
+  };
 }
 
 /** Persists the analytics object. */

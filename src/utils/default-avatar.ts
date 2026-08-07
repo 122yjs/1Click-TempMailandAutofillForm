@@ -1,9 +1,11 @@
 /**
  * Generate a lightweight SVG data-URL avatar for default identities.
  * No network; deterministic from seed string.
+ * Background colors come from the shared Google-style palette
+ * (src/utils/avatar-color.ts) so every avatar in the app looks consistent.
  */
 
-const PALETTE = ['#4c662b', '#386663', '#586249', '#795900', '#6b4f2a', '#3d5a80', '#7b2d8e'];
+import { GOOGLE_AVATAR_HEX } from '@/utils/avatar-color.js';
 
 function hashSeed(seed: string): number {
   let h = 0;
@@ -16,7 +18,7 @@ function hashSeed(seed: string): number {
 /** Simple initials avatar as data:image/svg+xml */
 export function generateDefaultAvatarDataUrl(seed: string, letter?: string): string {
   const ch = (letter || seed.trim()[0] || 'D').toUpperCase().slice(0, 1);
-  const bg = PALETTE[hashSeed(seed || ch) % PALETTE.length];
+  const bg = GOOGLE_AVATAR_HEX[hashSeed(seed || ch) % GOOGLE_AVATAR_HEX.length];
   const svg =
     `<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">` +
     `<rect width="128" height="128" rx="64" fill="${bg}"/>` +

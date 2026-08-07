@@ -72,6 +72,10 @@
             "type": "number",
             "description": "Default inbox expiry duration in milliseconds"
           },
+          "messageRetentionDuration": {
+            "type": "number",
+            "description": "Individual email message server retention duration in milliseconds"
+          },
           "renewable": {
             "type": "boolean",
             "description": "Whether inboxes can be renewed"
@@ -166,6 +170,24 @@
           },
           "selectMailboxOperation": { "type": "string" },
           "selectMailboxVariable": { "type": "string" },
+          "rawSource": {
+            "type": "object",
+            "required": ["operation", "itemIdParam", "sourcePath"],
+            "properties": {
+              "operation": {
+                "type": "string",
+                "description": "Operation name that returns the untouched raw MIME source for a message"
+              },
+              "itemIdParam": {
+                "type": "string",
+                "description": "Context variable name carrying the message id (e.g. email_id)"
+              },
+              "sourcePath": {
+                "type": "string",
+                "description": "Response path to the raw source string (e.g. source)"
+              }
+            }
+          },
           "sequenceTracking": {
             "type": "object",
             "required": ["enabled", "sequenceField", "listSequenceField", "sequenceOperation"],
@@ -182,6 +204,7 @@
             "properties": {
               "enabled": { "type": "boolean" },
               "path": { "type": "string" },
+              "hasAttachmentFlagPath": { "type": "string" },
               "fields": {
                 "type": "object",
                 "required": ["filename", "mimeType"],

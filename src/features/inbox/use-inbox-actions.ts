@@ -1,5 +1,4 @@
 import type { Browser } from 'wxt/browser';
-import type { ToastType } from '@/components/feedback/Toast.svelte';
 import type { InboxSetters } from '@/features/inbox/inbox-actions.js';
 import {
   checkMessages as checkMessagesAction,
@@ -10,6 +9,7 @@ import {
   selectAccount as selectAccountAction,
   toggleNotifications as toggleNotificationsAction,
 } from '@/features/inbox/inbox-actions.js';
+import type { ToastType } from '@/ui/blocks/feedback/Toast.svelte';
 import type { Account } from '@/utils/types.js';
 
 /**

@@ -1,6 +1,8 @@
 import type { Browser } from 'wxt/browser';
-import { t } from '@/utils/i18n-utils.js';
+import { getIconSvg } from '@/ui/components/icons/icon-svg.js';
+import { t, tSync } from '@/utils/i18n-utils.js';
 import { logError } from '@/utils/logger.js';
+import { PORTAL_Z } from '@/utils/portal-layers.js';
 import { toMs } from '@/utils/time.js';
 import type { Account, Email } from '@/utils/types.js';
 
@@ -33,7 +35,12 @@ export async function exportAccountEmails(ext: Browser, account: Account, setter
     if (!format) return;
 
     await exportEmailsWithFormat(account, msgs, format);
-  } catch (_e) {
+  } catch (e: unknown) {
+    logError(
+      'exportAccountEmails failed',
+      undefined,
+      e instanceof Error ? e : new Error(String(e))
+    );
     setters.setShowToast(await t('toasts.exportFailed'), 'error');
   }
 }
@@ -47,9 +54,11 @@ export function showExportFormatDialog(): Promise<string | null> {
     const dialog = document.createElement('div');
     dialog.setAttribute('role', 'dialog');
     dialog.setAttribute('aria-modal', 'true');
-    dialog.setAttribute('aria-label', 'Select export format');
+    dialog.setAttribute('aria-label', tSync('selectExportFormat'));
     dialog.style.cssText =
-      'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;';
+      'position:fixed;inset:0;z-index:' +
+      String(PORTAL_Z.dialog) +
+      ';display:flex;align-items:center;justify-content:center;';
 
     // Backdrop
     const backdrop = document.createElement('div');
@@ -67,11 +76,10 @@ export function showExportFormatDialog(): Promise<string | null> {
 
     // Close button (top-right of panel)
     const closeBtn = document.createElement('button');
-    closeBtn.setAttribute('aria-label', 'Close');
+    closeBtn.setAttribute('aria-label', tSync('close'));
     closeBtn.style.cssText =
       'position:absolute;top:12px;right:12px;width:32px;height:32px;border-radius:50%;border:none;background:var(--md-surface-variant,#e7e0ec);cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--md-on-surface,#1c1b1f);transition:background 0.15s;';
-    closeBtn.innerHTML =
-      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+    closeBtn.innerHTML = getIconSvg('x', { size: 16 });
     closeBtn.addEventListener('click', () => {
       dialog.remove();
       resolve(null);
@@ -81,13 +89,13 @@ export function showExportFormatDialog(): Promise<string | null> {
     const heading = document.createElement('h3');
     heading.style.cssText =
       'margin:0;font-size:16px;font-weight:700;color:var(--md-on-surface,#1c1b1f);padding-right:32px;';
-    heading.textContent = 'Select Export Format';
+    heading.textContent = tSync('backup.selectExportFormat');
 
     // Sub-label
     const sub = document.createElement('p');
     sub.style.cssText =
       'margin:0;margin-top:-12px;font-size:12px;color:var(--md-on-surface-variant,#49454f);';
-    sub.textContent = 'Choose a format for your exported emails';
+    sub.textContent = tSync('backup.chooseFormatHint');
 
     // Format buttons row
     const row = document.createElement('div');
@@ -152,16 +160,18 @@ export function showExportFormatDialog(): Promise<string | null> {
 export async function exportEmailsWithFormat(account: Account, msgs: Email[], format: string) {
   try {
     let content = '';
-    let filename = `${account.address.split('@')[0]}-emails`;
+    // Sanitize the local part for a filesystem-safe download name (same rule as
+    // the ZIP path): strip everything except alphanumerics and spaces.
+    const localPart = (account.address.split('@')[0] || 'emails')
+      .replace(/[^a-zA-Z0-9\s]/g, '_')
+      .replace(/\s+/g, ' ')
+      .trim();
+    let filename = `${localPart}-emails`;
     let mimeType = 'text/plain';
 
     switch (format) {
       case 'json':
-        content = JSON.stringify(
-          { address: account.address, provider: account.provider, messages: msgs },
-          null,
-          2
-        );
+        content = JSON.stringify(buildJsonExportPayload(account, msgs), null, 2);
         filename += '.json';
         mimeType = 'application/json';
         break;
@@ -199,26 +209,134 @@ export async function exportEmailsWithFormat(account: Account, msgs: Email[], fo
   }
 }
 
+/** Sanitizes values that end up inside MIME headers (filename / mimeType) to
+ * prevent header injection from provider-supplied metadata. */
+function sanitizeHeaderToken(value: string): string {
+  return value.replace(/[\r\n"\\]/g, '_');
+}
+
+/**
+ * Generates a single EML message. When the email carries attachment metadata
+ * (filenames/MIME types), the message is built as `multipart/mixed` with one
+ * MIME part per attachment so that metadata survives backup/import — the file
+ * data itself was never downloaded, so each attachment part carries a short
+ * note instead of bytes. Emails without attachments are a single-part message
+ * whose Content-Type honestly reflects the body: `text/html` when an HTML body
+ * exists, otherwise `text/plain`. Labeling HTML as text/plain would make every
+ * email client render the raw markup as plain text.
+ */
 export function generateSingleEMLContent(account: Account, message: Email): string {
-  const fromEmail = message.from_name || 'unknown@example.com';
+  // When the provider exposed the untouched raw MIME source (e.g. Guerrilla
+  // Mail's `get_email_source`), emit it verbatim — headers, multipart
+  // structure, original styling, and all. This is pixel-faithful; the
+  // synthesized fallback below only applies to legacy stored emails.
+  if (message.raw_source) {
+    const source = message.raw_source.endsWith('\n')
+      ? message.raw_source
+      : `${message.raw_source}\n`;
+    return source;
+  }
+
+  // Prefer the actual sender address; from_name is a display name and must
+  // never stand in for the address in From/Return-Path headers.
+  const fromEmail = message.from || message.from_name || 'unknown@example.com';
   const subject = message.subject || 'No Subject';
   const date = new Date(toMs(message.received_at || Date.now() / 1000)).toUTCString();
-  const body = message.body_html || message.body_plain || 'No content';
+  const bodyPlain = message.body_plain || message.body || 'No content';
+  const bodyHtml = message.body_html;
+  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
 
-  let emlContent = '';
-  emlContent += `Return-Path: <${fromEmail}>\n`;
-  emlContent += `Delivered-To: ${account.address}\n`;
-  emlContent += `From: ${fromEmail}\n`;
-  emlContent += `To: ${account.address}\n`;
-  emlContent += `Subject: ${subject}\n`;
-  emlContent += `Date: ${date}\n`;
-  emlContent += `Message-ID: <${message.id || Date.now()}@${account.address}>\n`;
-  emlContent += `MIME-Version: 1.0\n`;
-  emlContent += `Content-Type: text/plain; charset=UTF-8\n`;
-  emlContent += `\n`;
-  emlContent += `${body}\n`;
+  const header =
+    `Return-Path: <${fromEmail}>\n` +
+    `Delivered-To: ${account.address}\n` +
+    `From: ${fromEmail}\n` +
+    `To: ${account.address}\n` +
+    `Subject: ${subject}\n` +
+    `Date: ${date}\n` +
+    `Message-ID: <${message.id || Date.now()}@${account.address}>\n` +
+    `MIME-Version: 1.0\n`;
 
-  return emlContent;
+  if (attachments.length === 0) {
+    // Single-part EML. The Content-Type must match the body actually written:
+    // HTML bodies labeled text/plain (as the source emails sometimes are) show
+    // as raw markup in every email client, so write text/html when we have it.
+    const body = bodyHtml || bodyPlain;
+    const contentType = bodyHtml ? 'text/html' : 'text/plain';
+    return `${header}Content-Type: ${contentType}; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n\n${body}\n`;
+  }
+
+  const boundary = `_scout_bnd_${Date.now().toString(36)}_${Math.random()
+    .toString(36)
+    .slice(2, 12)}`;
+  const lines: string[] = [];
+  lines.push(`${header}Content-Type: multipart/mixed; boundary="${boundary}"`);
+  lines.push('');
+  lines.push(`--${boundary}`);
+  // Body part (HTML when available, otherwise plain text)
+  lines.push(
+    bodyHtml ? 'Content-Type: text/html; charset=UTF-8' : 'Content-Type: text/plain; charset=UTF-8'
+  );
+  lines.push('Content-Transfer-Encoding: 8bit');
+  lines.push('');
+  lines.push(bodyHtml || bodyPlain);
+  // Attachment parts — metadata only (file bytes were not captured)
+  for (const att of attachments) {
+    const filename = sanitizeHeaderToken(att.filename || 'attachment');
+    const mimeType = sanitizeHeaderToken(att.mimeType || 'application/octet-stream');
+    lines.push('');
+    lines.push(`--${boundary}`);
+    lines.push(`Content-Type: ${mimeType}; name="${filename}"`);
+    lines.push(`Content-Disposition: attachment; filename="${filename}"`);
+    lines.push('Content-Transfer-Encoding: 8bit');
+    lines.push('');
+    lines.push(
+      `[Attachment metadata preserved from backup export — filename: ${filename}, type: ${mimeType}]`
+    );
+  }
+  lines.push('');
+  lines.push(`--${boundary}--`);
+  lines.push('');
+  return lines.join('\n');
+}
+
+/** JSON export payload — embeds an explicit `attachments` manifest (message
+ * id + filename + MIME type per file) alongside the full messages so attachment
+ * metadata survives backup independent of walking the message array. */
+export interface JsonExportPayload {
+  address: string;
+  provider: string;
+  messages: Email[];
+  attachments: {
+    messageId: string;
+    subject: string;
+    from: string;
+    receivedAt: number;
+    filename: string;
+    mimeType: string;
+    partNumber?: string;
+    downloadUrl?: string | null;
+  }[];
+}
+
+export function buildJsonExportPayload(account: Account, msgs: Email[]): JsonExportPayload {
+  const attachments = msgs.flatMap((m) =>
+    (Array.isArray(m.attachments) ? m.attachments : []).map((att) => ({
+      messageId: m.id,
+      subject: m.subject || '',
+      from: m.from || '',
+      receivedAt: m.received_at,
+      filename: att.filename,
+      mimeType: att.mimeType,
+      partNumber: att.partNumber,
+      downloadUrl: att.downloadUrl ?? null,
+    }))
+  );
+  return {
+    address: account.address,
+    provider: account.provider,
+    messages: msgs,
+    attachments,
+  };
 }
 
 /**
@@ -231,35 +349,21 @@ export function generateSingleEMLContent(account: Account, message: Email): stri
  * @returns A string containing the MBOX formatted email data
  */
 export function generateMBOXContent(account: Account, messages: Email[]): string {
-  let mboxContent = '';
-  messages.forEach((message, index) => {
+  const blocks: string[] = [];
+  messages.forEach((message) => {
     const fromEmail = (message.from || 'unknown@example.com').replace(/[\r\n]/g, ' ');
-    const fromName = message.from_name
-      ? `"${message.from_name.replace(/"/g, '\\"')}" <${fromEmail}>`
-      : fromEmail;
-    const subject = message.subject || 'No Subject';
     const date = new Date(toMs(message.received_at || Date.now() / 1000)).toUTCString();
-    const isHtml = !!message.body_html;
-    let body = message.body_html || message.body_plain || 'No content';
-    // Escape lines starting with "From " (mboxrd format)
-    body = body.replace(/^From /gm, '>From ');
-
-    mboxContent += `From ${fromEmail} ${date}\n`;
-    mboxContent += `Return-Path: <${fromEmail}>\n`;
-    mboxContent += `Delivered-To: ${account.address}\n`;
-    mboxContent += `From: ${fromName}\n`;
-    mboxContent += `To: ${account.address}\n`;
-    mboxContent += `Subject: ${subject}\n`;
-    mboxContent += `Date: ${date}\n`;
-    mboxContent += `Message-ID: <${message.id || Date.now()}-${index}@${account.address}>\n`;
-    mboxContent += `MIME-Version: 1.0\n`;
-    mboxContent += `Content-Type: ${isHtml ? 'text/html' : 'text/plain'}; charset=UTF-8\n`;
-    mboxContent += `Content-Transfer-Encoding: 8bit\n`;
-    mboxContent += `\n`;
-    mboxContent += `${body}\n`;
-    mboxContent += `\n`;
+    // Reuse the EML builder so attachment metadata (filenames/MIME types)
+    // survives MBOX backups too — multipart/mixed when attachments exist.
+    const eml = generateSingleEMLContent(account, message);
+    // Escape lines starting with "From " anywhere in the message (mboxrd
+    // format) so embedded quotes/bodies can't fake the MBOX separator.
+    const escaped = eml.replace(/^From /gm, '>From ');
+    blocks.push(`From ${fromEmail} ${date}\n${escaped}`);
   });
-  return mboxContent;
+  // Blocks already end with a newline, so a single '\n' join yields exactly
+  // one blank line between messages (MBOX message separation).
+  return blocks.join('\n');
 }
 
 export async function exportMultipleEMLAsZip(

@@ -20,11 +20,12 @@ export interface LoginSetters {
  * that remains stable even if items are reordered.
  */
 function stableLoginId(item: CredentialsHistoryItem): string {
-  // If item already has a stable id (not index-based), reuse it
   if (item.id && !item.id.match(/-\d+$/)) {
     return item.id;
   }
-  const raw = `${item.domain}|${item.username ?? ''}|${item.timestamp}`;
+  // Fallback for legacy items without an ID before they get saved with a UUID.
+  // Use a string that won't change when credential updates (e.g. timestamp updates).
+  const raw = `${item.domain}|${item.email || ''}|${item.username || ''}`;
   return `login_${raw.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 }
 
@@ -34,13 +35,21 @@ export async function loadLoginInfo(ext: Browser, setters: LoginSetters) {
       loginInfo?: CredentialsHistoryItem[];
     };
     const loginInfo = result.loginInfo || [];
-    // Decrypt passwords (encrypted at rest by form-filler.ts) then assign stable ids
+
+    let needsSave = false;
+    for (const item of loginInfo) {
+      if (!item.id || item.id.match(/-\d+$/)) {
+        item.id = crypto.randomUUID();
+        needsSave = true;
+      }
+    }
+
+    if (needsSave) {
+      await ext.storage.local.set({ loginInfo });
+    }
+
     const decrypted = await decryptCredentials(loginInfo);
-    const savedLogins = decrypted.map((item) => ({
-      ...item,
-      id: stableLoginId(item),
-    }));
-    setters.setSavedLogins(savedLogins);
+    setters.setSavedLogins(decrypted);
   } catch (e: unknown) {
     logError('loadLoginInfo error:', undefined, e instanceof Error ? e : new Error(String(e)));
   }

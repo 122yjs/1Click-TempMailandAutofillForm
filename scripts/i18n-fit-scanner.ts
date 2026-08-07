@@ -17,8 +17,8 @@
  * review - not a substitute for real browser layout.
  */
 
-import { FIT_BUDGETS } from '../src/utils/i18n-fit-budgets';
-import { type FitRow, flattenLocale, scanLocaleFit } from '../src/utils/i18n-fit-scan';
+import { FIT_BUDGETS } from './i18n-fit/i18n-fit-budgets';
+import { type FitRow, flattenLocale, scanLocaleFit } from './i18n-fit/i18n-fit-scan';
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 

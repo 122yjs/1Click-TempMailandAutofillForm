@@ -3,11 +3,18 @@
  * Uses closed shadow host (same as autofill buttons).
  */
 
-import { browser } from 'wxt/browser';
-import { t } from '@/utils/i18n-utils.js';
+import { watchOtpFailure } from '@/features/intelligence/conflict-watch.js';
+import {
+  copyToClipboardViaBg,
+  getStorageViaBg,
+  sendMessageViaBg,
+} from '@/utils/content-bg-bridge.js';
+import { t } from '@/utils/content-i18n.js';
 import { logDebug } from '@/utils/logger.js';
+import { CONTENT_Z } from '@/utils/portal-layers.js';
+import { toMs } from '@/utils/time.js';
 import { BUTTON_CLASS, getOrCreateShadowRoot } from '../dom/shadow-dom.js';
-import { fillOtp } from './otp-handler.js';
+import { fillOtp, findOtpInputs } from './otp-handler.js';
 
 const PANEL_ID = 'oc-wait-otp-panel';
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
@@ -28,13 +35,45 @@ function formatMmSs(ms: number): string {
 }
 
 /**
- * Show floating Wait-for-OTP panel. Replaces any existing panel.
+ * Detect whether current page requests email verification (OTP, Magic Link, Enter Code).
+ */
+export function isVerificationPage(root: ParentNode = document): boolean {
+  try {
+    const otcInput = root.querySelector(
+      'input[autocomplete="one-time-code"], input[name*="otp" i], input[id*="otp" i], input[name*="verification" i], input[id*="verification" i]'
+    );
+    if (otcInput) return true;
+
+    const text = (root instanceof Document ? root.body?.textContent : root.textContent) || '';
+    const re =
+      /\b(otp|verification code|one-time password|magic link|enter code|check your email|verify your email|confirmation code|passcode|رمز التحقق|كود التأكيد|código de verificación|code de vérification|bestätigungscode|認証コード|验证码|인증 Code)\b/i;
+    return re.test(text);
+  } catch {
+    // On DOM access errors, err on the side of caution: assume it is NOT a
+    // verification page to avoid unnecessary OTP panel injection.
+    return false;
+  }
+}
+
+/**
+ * Show floating Wait-for-OTP / Verification Pending panel. Replaces any existing panel.
  */
 export async function showWaitOtpPanel(opts?: {
   email?: string | null;
   timeoutMs?: number;
   autoFill?: boolean;
+  skipIfNotVerificationPage?: boolean;
 }): Promise<WaitOtpPanelHandle> {
+  if (opts?.skipIfNotVerificationPage && !isVerificationPage()) {
+    // Even if the page text doesn't mention verification, if we detect OTP
+    // input fields (e.g. 6-digit digit boxes, autocomplete=one-time-code),
+    // still show the panel so the OTP can be auto-filled when it arrives.
+    const hasOtpInputs = findOtpInputs().length > 0;
+    if (!hasOtpInputs) {
+      return { cleanup: () => {}, notifyOtp: async () => {} };
+    }
+  }
+
   if (activeHandle) {
     activeHandle.cleanup();
     activeHandle = null;
@@ -54,7 +93,7 @@ export async function showWaitOtpPanel(opts?: {
   const deadline = startedAt + timeoutMs;
   let filledOtp: string | null = null;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
-  let storageListener:
+  let _storageListener:
     | ((changes: Record<string, { newValue?: unknown }>, area: string) => void)
     | null = null;
 
@@ -65,7 +104,7 @@ export async function showWaitOtpPanel(opts?: {
     position: fixed;
     bottom: 24px;
     right: 24px;
-    z-index: 2147483645;
+    z-index: ${CONTENT_Z.overlay};
     pointer-events: auto;
     min-width: 260px;
     max-width: min(360px, calc(100vw - 32px));
@@ -169,19 +208,58 @@ export async function showWaitOtpPanel(opts?: {
   panel.appendChild(actions);
   root.appendChild(panel);
 
+  // Keyboard navigation: ArrowLeft/ArrowRight navigate between buttons,
+  // Enter/Space activate the focused button, Escape dismisses the panel.
+  const focusableButtons: HTMLElement[] = [];
+  // Only include copy/fill buttons (close stays reachable via Esc / tab)
+  if (copyBtn) focusableButtons.push(copyBtn);
+  if (fillBtn) focusableButtons.push(fillBtn);
+  let focusIndex = 0;
+
+  function focusButton(idx: number): void {
+    focusIndex = (idx + focusableButtons.length) % focusableButtons.length;
+    const btn = focusableButtons[focusIndex];
+    btn?.focus();
+  }
+
+  panel.addEventListener('keydown', (e: KeyboardEvent) => {
+    if (e.target !== panel && e.target !== document.body) return;
+    switch (e.key) {
+      case 'Escape':
+        e.preventDefault();
+        e.stopPropagation();
+        cleanup();
+        break;
+      case 'ArrowLeft':
+        e.preventDefault();
+        focusButton(focusIndex - 1);
+        break;
+      case 'ArrowRight':
+        e.preventDefault();
+        focusButton(focusIndex + 1);
+        break;
+      case 'Enter':
+        if (document.activeElement instanceof HTMLElement && e.target === panel) {
+          e.preventDefault();
+          focusableButtons[focusIndex]?.click();
+        }
+        break;
+    }
+  });
+
+  // Focus the first actionable button on mount for keyboard users
+  if (filledOtp) {
+    copyBtn?.focus();
+  } else {
+    closeBtn?.focus();
+  }
+
   const cleanup = () => {
     if (tickTimer) {
       clearInterval(tickTimer);
       tickTimer = null;
     }
-    if (storageListener) {
-      try {
-        browser.storage.onChanged.removeListener(storageListener);
-      } catch {
-        /* ignore */
-      }
-      storageListener = null;
-    }
+    _storageListener = null;
     panel.remove();
     if (activeHandle?.cleanup === cleanup) activeHandle = null;
   };
@@ -200,6 +278,8 @@ export async function showWaitOtpPanel(opts?: {
     otpDisplay.textContent = otp;
     copyBtn.style.display = 'block';
     fillBtn.style.display = 'block';
+    focusIndex = 0;
+    void copyBtn.focus();
     status.textContent = await t('contentAutofill.waitForOtpReceived');
     if (meta?.sender) {
       status.textContent += ` · ${meta.sender}`;
@@ -208,25 +288,49 @@ export async function showWaitOtpPanel(opts?: {
       try {
         await fillOtp(otp);
         status.textContent = await t('contentAutofill.otpFilled');
+        // If site rejects the code, prompt user to enter manually
+        try {
+          watchOtpFailure(document, () => {
+            void (async () => {
+              status.textContent = await t('contentAutofill.otpFailedManual');
+              fillBtn.style.display = 'block';
+              copyBtn.style.display = 'block';
+              // Focus first OTP field for manual entry
+              try {
+                const inputs = findOtpInputs();
+                inputs[0]?.focus();
+                inputs[0]?.select?.();
+              } catch {
+                /* ignore */
+              }
+            })();
+          });
+        } catch {
+          /* optional */
+        }
       } catch (e) {
         logDebug(`Wait OTP auto-fill failed: ${String(e)}`);
+        status.textContent = await t('contentAutofill.otpFailedManual');
       }
     }
   };
 
   copyBtn.addEventListener('click', async (e) => {
+    if (!e.isTrusted) return;
     e.preventDefault();
     e.stopPropagation();
     if (!filledOtp) return;
     try {
-      await navigator.clipboard.writeText(filledOtp);
+      await copyToClipboardViaBg(filledOtp);
       copyBtn.textContent = await t('contentAutofill.waitForOtpCopied');
     } catch {
       /* ignore */
+      copyBtn.textContent = await t('contentAutofill.otpCopyFailed');
     }
   });
 
   fillBtn.addEventListener('click', async (e) => {
+    if (!e.isTrusted) return;
     e.preventDefault();
     e.stopPropagation();
     if (!filledOtp) return;
@@ -249,31 +353,16 @@ export async function showWaitOtpPanel(opts?: {
   }, TICK_MS);
 
   // Listen for latestOtp storage updates from background
-  storageListener = (changes, area) => {
-    if (area !== 'local' || !changes.latestOtp) return;
-    const v = changes.latestOtp.newValue as
-      | { otp?: string; sender?: string; received_at?: number }
-      | undefined;
-    if (!v?.otp) return;
-    // Only accept OTPs received after panel opened
-    if (v.received_at && v.received_at * 1000 < startedAt - 5000) return;
-    void applyOtp(v.otp, { sender: v.sender });
-  };
-  try {
-    browser.storage.onChanged.addListener(storageListener);
-  } catch {
-    /* ignore */
-  }
 
   // Also check current latestOtp once (may already be waiting in storage)
   try {
-    const { latestOtp } = (await browser.storage.local.get(['latestOtp'])) as {
+    const { latestOtp } = (await getStorageViaBg(['latestOtp'])) as {
       latestOtp?: { otp?: string; sender?: string; received_at?: number };
     };
     if (
       latestOtp?.otp &&
       latestOtp.received_at &&
-      latestOtp.received_at * 1000 >= startedAt - 2000
+      toMs(latestOtp.received_at) >= startedAt - 2000
     ) {
       void applyOtp(latestOtp.otp, { sender: latestOtp.sender });
     }
@@ -283,13 +372,11 @@ export async function showWaitOtpPanel(opts?: {
 
   // Ask background to refresh mail for active inbox (best-effort)
   try {
-    const { activeInboxId } = (await browser.storage.local.get(['activeInboxId'])) as {
+    const { activeInboxId } = (await getStorageViaBg(['activeInboxId'])) as {
       activeInboxId?: string;
     };
     if (activeInboxId) {
-      void browser.runtime
-        .sendMessage({ type: 'checkEmails', inboxId: activeInboxId })
-        .catch(() => {});
+      void sendMessageViaBg({ type: 'checkEmails', inboxId: activeInboxId }).catch(() => {});
     }
   } catch {
     /* ignore */

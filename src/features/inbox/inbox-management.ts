@@ -1,9 +1,11 @@
-import type { ToastType } from '@/components/feedback/Toast.svelte';
-import { loadProviderConfig } from '@/utils/email-service.js';
+import type { ToastType } from '@/ui/blocks/feedback/Toast.svelte';
+import { loadProviderConfig, tryLoadProviderConfig } from '@/utils/email-service.js';
+// loadProviderConfig kept for canRenew and other call sites below
 import { getErrorMessage } from '@/utils/errors.js';
 import { t } from '@/utils/i18n-utils.js';
 import { detectIconFromMessage } from '@/utils/iconMapping.js';
 import { logError } from '@/utils/logger.js';
+import { getInboxes, setInboxes } from '@/utils/storage-keys.js';
 import type { Account, Email } from '@/utils/types.js';
 
 export interface ManagementState {
@@ -42,13 +44,12 @@ export interface ManagementSetters {
  */
 export async function toggleAutoExtend(ext: Browser, account: Account, setters: ManagementSetters) {
   try {
-    const result = (await ext.storage.local.get(['inboxes'])) as { inboxes?: Account[] };
-    const inboxes = result.inboxes || [];
+    const inboxes = await getInboxes();
     const newAutoExtendValue = !account.autoExtend;
     const updated = inboxes.map((i: Account) =>
       i.id === account.id ? { ...i, autoExtend: newAutoExtendValue } : i
     );
-    await ext.storage.local.set({ inboxes: updated });
+    await setInboxes(updated);
     // Immediately update reactive state for UI reactivity using functional update to preserve computed fields
     if (setters.setAllInboxes) {
       setters.setAllInboxes((prev) =>
@@ -63,8 +64,10 @@ export async function toggleAutoExtend(ext: Browser, account: Account, setters: 
     // (dismissing the renew strip previously left the flag on without extending).
     if (newAutoExtendValue) {
       const now = Date.now();
-      const isExpired = account.expiresAt > 0 && account.expiresAt <= now;
-      if (isExpired && (await canRenew(account.provider))) {
+      const isNearingOrExpired =
+        account.expiresAt > 0 &&
+        (account.expiresAt <= now || account.expiresAt - now <= 10 * 60 * 1000);
+      if (isNearingOrExpired && (await canRenew(account.provider))) {
         try {
           setters.setShowToast(await t('toasts.extendingExpiry'));
           const renewResult = await ext.runtime.sendMessage({
@@ -108,7 +111,7 @@ export async function toggleAutoExtend(ext: Browser, account: Account, setters: 
       type: iconType,
     });
   } catch (_e) {
-    setters.setShowToast({ message: 'Failed to toggle auto-extend', type: 'error' });
+    setters.setShowToast({ message: await t('toasts.autoExtendToggleFailed'), type: 'error' });
   }
 }
 
@@ -257,12 +260,34 @@ export async function removeAccount(
           lastMessageTimestamps[acct.id] = storageSnapshot.lastMessageTimestamps[acct.id];
         }
 
+        // Merge read/star state per-id so undoing this inbox's delete doesn't
+        // clobber read/star changes that happened in other inboxes meanwhile.
+        const readEmails = { ...(current.readEmails || {}) };
+        if (storageSnapshot.readEmails) {
+          // Restore only the read-state keys that belong to the deleted inbox:
+          // compound keys `${address}_${id}` plus the bare ids of its stored emails.
+          const deletedReadKeys = new Set<string>();
+          const prefix = `${acct.address}_`;
+          for (const key of Object.keys(storageSnapshot.readEmails)) {
+            if (key.startsWith(prefix)) deletedReadKeys.add(key);
+          }
+          for (const email of storageSnapshot.storedEmails?.[acct.address] || []) {
+            deletedReadKeys.add(email.id);
+          }
+          for (const [k, v] of Object.entries(storageSnapshot.readEmails)) {
+            if (deletedReadKeys.has(k)) readEmails[k] = v;
+          }
+        }
+        const starredEmails = [
+          ...new Set([...(current.starredEmails || []), ...(storageSnapshot.starredEmails || [])]),
+        ];
+
         await ext.storage.local.set({
           inboxes: restoredInboxes,
           storedEmails,
           archivedEmails,
-          readEmails: storageSnapshot.readEmails || current.readEmails || {},
-          starredEmails: storageSnapshot.starredEmails || current.starredEmails || [],
+          readEmails,
+          starredEmails,
           seenEmailIds,
           lastMessageTimestamps,
         });
@@ -357,14 +382,15 @@ export async function unarchiveAccount(ext: Browser, account: Account, setters: 
     if (setters.setArchivedSectionOpen) {
       await setters.setArchivedSectionOpen(false);
     }
-    const iconType = detectIconFromMessage(`Address ${account.address} unarchived`);
+    const unarchivedMsg = await t('toasts.addressUnarchived', { address: account.address });
+    const iconType = detectIconFromMessage(unarchivedMsg);
     setters.setShowToast({
-      message: `Address ${account.address} unarchived`,
+      message: unarchivedMsg,
       type: iconType,
     });
   } catch (e) {
     logError('unarchiveAccount error:', undefined, e instanceof Error ? e : new Error(String(e)));
-    setters.setShowToast({ message: 'Failed to unarchive', type: 'error' });
+    setters.setShowToast({ message: await t('toasts.unarchiveFailed'), type: 'error' });
   }
 }
 
@@ -382,34 +408,44 @@ export async function restoreAccount(ext: Browser, account: Account, setters: Ma
     if (setters.setArchivedSectionOpen) {
       await setters.setArchivedSectionOpen(false);
     }
-    const iconType = detectIconFromMessage(`Address ${account.address} restored`);
+    const restoredMsg = await t('toasts.addressRestored', { address: account.address });
+    const iconType = detectIconFromMessage(restoredMsg);
     setters.setShowToast({
-      message: `Address ${account.address} restored`,
+      message: restoredMsg,
       type: iconType,
     });
   } catch (e) {
     logError('restoreAccount error:', undefined, e instanceof Error ? e : new Error(String(e)));
-    setters.setShowToast({ message: 'Failed to restore', type: 'error' });
+    setters.setShowToast({ message: await t('toasts.restoreFailed'), type: 'error' });
   }
 }
 
 /**
- * Check if an account can be unarchived
- * @param account - Account to check
- * @returns true if the account can be unarchived
+ * Check if an account can be unarchived (JSON-driven via providers.jsonc ui.canUnarchive).
+ * Expired non-renewable addresses cannot be unarchived (nothing to renew into).
+ * Never throws — unknown/missing provider → false.
  */
 export function canUnarchive(account: Account): boolean {
-  const config = loadProviderConfig(account.provider);
-  const canUnarchiveRule = config.ui?.canUnarchive;
+  const config = tryLoadProviderConfig(account.provider);
+  if (!config) return false;
 
+  const isExpired =
+    (typeof account.expiresAt === 'number' &&
+      account.expiresAt > 0 &&
+      account.expiresAt <= Date.now()) ||
+    account.status === 'expired';
+  const renewable = !!(config.expiry?.renewable || config.capabilities?.supportsRenew);
+  // Expired + non-renewable: keep archived; Unarchive would be meaningless
+  if (isExpired && !renewable) return false;
+
+  const canUnarchiveRule = config.ui?.canUnarchive;
   if (canUnarchiveRule === 'ifNotExpired') {
-    const isExpired = account.expiresAt > 0 && account.expiresAt <= Date.now();
-    const currentStatus = account.status || account.accountStatus;
+    // Prefer accountStatus (storage), then display status
+    const currentStatus = account.accountStatus || account.status;
     return currentStatus !== 'expired' && !isExpired;
-  } else if (canUnarchiveRule) {
-    return true;
   }
-  return false;
+  // Explicit true only (avoid treating random strings as allow)
+  return canUnarchiveRule === true;
 }
 
 async function canRenew(providerId: string): Promise<boolean> {

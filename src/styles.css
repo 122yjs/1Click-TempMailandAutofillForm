@@ -241,6 +241,40 @@
   --text-title-md--line-height: var(--md-type-title-medium-line);
   --text-title-lg: var(--md-type-title-large-size);
   --text-title-lg--line-height: var(--md-type-title-large-line);
+
+  /* ── MD3 shape scale (corner radius) ─────────────────────────────────── */
+  --md-shape-extra-small: 0.25rem; /* 4px  — text buttons, chips */
+  --md-shape-small: 0.5rem; /* 8px   — cards, inputs */
+  --md-shape-medium: 0.75rem; /* 12px  — dialogs, menus */
+  --md-shape-large: 1rem; /* 16px  — bottom sheets, large cards */
+  --md-shape-extra-large: 1.75rem; /* 28px  — FAB, dialogs (MD3 2024) */
+  --md-shape-full: 9999px; /* full  — pills, buttons */
+
+  /* Map Tailwind rounded-* utilities to the MD3 shape scale */
+  --radius-xs: var(--md-shape-extra-small);
+  --radius-sm: var(--md-shape-extra-small);
+  --radius-md: var(--md-shape-small);
+  --radius-lg: var(--md-shape-medium);
+  --radius-xl: var(--md-shape-large);
+  --radius-2xl: var(--md-shape-extra-large);
+  --radius-3xl: 2rem; /* 32px — large dialogs */
+  --radius-full: var(--md-shape-full);
+
+  /* ── MD3 elevation scale (dp → shadow) ───────────────────────────────── */
+  --md-elevation-0: none;
+  --md-elevation-1: 0 1px 2px rgb(0 0 0 / 0.3), 0 1px 3px 1px rgb(0 0 0 / 0.15);
+  --md-elevation-2: 0 1px 2px rgb(0 0 0 / 0.3), 0 2px 6px 2px rgb(0 0 0 / 0.15);
+  --md-elevation-3: 0 1px 3px rgb(0 0 0 / 0.3), 0 4px 8px 3px rgb(0 0 0 / 0.15);
+  --md-elevation-4: 0 2px 3px rgb(0 0 0 / 0.3), 0 6px 10px 4px rgb(0 0 0 / 0.15);
+  --md-elevation-5: 0 4px 4px rgb(0 0 0 / 0.3), 0 8px 12px 6px rgb(0 0 0 / 0.15);
+
+  /* Map Tailwind shadow-* utilities to MD3 elevation levels */
+  --shadow-xs: var(--md-elevation-1);
+  --shadow-sm: var(--md-elevation-1);
+  --shadow-md: var(--md-elevation-2);
+  --shadow-lg: var(--md-elevation-3);
+  --shadow-xl: var(--md-elevation-4);
+  --shadow-2xl: var(--md-elevation-5);
 }
 
 @layer base {
@@ -264,21 +298,20 @@
   [data-density="compact"] {
     --density-pad-y: 0.25rem;
     --density-pad-x: 0.5rem;
-    --density-row: 1.75rem;
+    --density-row: 2.75rem; /* 44px: fits 35px avatar + padding */
     --density-strip: 2rem;
     --density-gap: 0.25rem;
   }
   [data-density="comfortable"] {
     --density-pad-y: 0.5rem;
     --density-pad-x: 0.75rem;
-    --density-row: 2.125rem;
+    --density-row: 3rem; /* 48px: fits 35px avatar + padding comfortably */
     --density-strip: 2.5rem;
     --density-gap: 0.5rem;
   }
 
   .density-row {
-    min-height: var(--density-row, 2.125rem);
-    /* No forced padding — callers control padding (email list rows stay tight) */
+    min-height: var(--density-row, 2.75rem);
   }
   .density-row-pad {
     min-height: var(--density-row, 2.125rem);
@@ -337,6 +370,19 @@
       var(--md-tertiary-container)
     );
   }
+  .menu-list-item.is-danger {
+    color: var(--md-error);
+  }
+  .menu-list-item.is-danger .menu-list-icon,
+  .menu-list-item.is-danger .menu-list-trailing {
+    color: var(--md-error);
+  }
+  .menu-list-item.is-danger:hover:not(:disabled):not(.is-disabled) {
+    background-color: color-mix(in srgb, var(--md-error) 8%, transparent);
+  }
+  .menu-list-item.is-danger:active:not(:disabled):not(.is-disabled) {
+    background-color: color-mix(in srgb, var(--md-error) 12%, transparent);
+  }
   .menu-list-item.is-disabled,
   .menu-list-item:disabled {
     opacity: 0.4;
@@ -369,7 +415,7 @@
 
   * {
     scrollbar-width: thin;
-    scrollbar-color: var(--md-primary) transparent;
+    scrollbar-color: color-mix(in srgb, var(--md-primary) 65%, transparent) transparent;
   }
   ::-webkit-scrollbar {
     width: 6px;
@@ -379,11 +425,11 @@
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background-color: var(--md-primary);
+    background-color: color-mix(in srgb, var(--md-primary) 60%, transparent);
     border-radius: 99px;
   }
   ::-webkit-scrollbar-thumb:hover {
-    filter: brightness(1.2);
+    background-color: var(--md-primary);
   }
 
   html {
@@ -440,6 +486,17 @@ body {
   max-width: 100%;
 }
 
+.btn-icon {
+  background-color: rgba(255, 255, 255, 0.2);
+  width: var(--action-btn-icon-size, calc(var(--action-btn-font, 0.75rem) * 1.6));
+  height: var(--action-btn-icon-size, calc(var(--action-btn-font, 0.75rem) * 1.6));
+}
+
+.btn-icon svg {
+  width: var(--action-btn-svg-size, calc(var(--action-btn-font, 0.75rem) * 1.15));
+  height: var(--action-btn-svg-size, calc(var(--action-btn-font, 0.75rem) * 1.15));
+}
+
 /* Dynamic action buttons - using Material Design color tokens */
 .btn-primary {
   background-color: var(--md-primary);
@@ -485,11 +542,12 @@ body {
   stroke: var(--md-on-error);
 }
 
-.btn-icon {
-  background-color: rgba(255, 255, 255, 0.2);
-}
-
-/* Disable focus rings and outlines globally (unlayered, highest priority) */
+/* Disable focus rings and outlines globally (unlayered, highest priority).
+   NOTE: We intentionally do NOT suppress `outline` / `box-shadow` on
+   focusable elements — that would break WCAG 2.4.7 (Focus Visible) and the
+   MD3 :focus-visible focus ring in @layer base. We only clear the Tailwind
+   ring variables so components that set their own :focus-visible ring are
+   not double-outlined. */
 *:focus,
 *:focus-within,
 *:focus-visible,
@@ -502,8 +560,6 @@ select:focus,
 [type="password"]:focus,
 [type="search"]:focus,
 [type="number"]:focus {
-  outline: none !important;
-  box-shadow: none !important;
   --tw-ring-width: 0px !important;
   --tw-ring-shadow: none !important;
   --tw-ring-offset-shadow: none !important;
@@ -528,7 +584,7 @@ textarea.bg-transparent:focus {
   width: 0.75rem; /* w-3 - pair with h-3 track thumbs */
   height: 0.75rem;
   border-radius: 9999px;
-  background: #fff;
+  background: var(--md-surface);
   box-shadow: 0 1px 2px rgb(0 0 0 / 0.15);
   transition:
     inset-inline-start var(--motion-fast, 120ms)
@@ -576,7 +632,7 @@ textarea.bg-transparent:focus {
   width: 1rem;
   height: 1rem;
   border-radius: 9999px;
-  background: #fff;
+  background: var(--md-surface);
   transition: inset-inline-start 0.15s ease;
 }
 .peer:checked ~ .md-peer-switch::after,
@@ -597,6 +653,52 @@ textarea.bg-transparent:focus {
   padding-inline-end: 2rem;
   font-size: var(--md-type-label-medium-size, 0.75rem);
   border-radius: 0.75rem;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Text Selection Policy                                                     */
+/* -------------------------------------------------------------------------- */
+body,
+html,
+button,
+div,
+span,
+a,
+p,
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+li,
+td,
+th {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Exceptions: Allow selection only inside Message Detail email body and input controls */
+[data-selectable-text="true"],
+.email-body,
+.select-text,
+input,
+textarea,
+[contenteditable="true"] {
+  -webkit-user-select: text !important;
+  user-select: text !important;
+}
+
+/* HTML Email message body: HOST-LEVEL rules only. The .email-body host div
+   (EmailBody.svelte) is the single light-DOM element; its descendants live
+   inside a Shadow DOM root, so global selectors like .email-body img can no
+   longer reach them. Content typography is the single source of truth in
+   EmailBody.svelte's EMAIL_BODY_CSS (injected into the shadow root). */
+.email-body {
+  overflow-x: auto;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  color: inherit;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -800,8 +902,15 @@ textarea.bg-transparent:focus {
   animation: email-row-exit var(--motion-slow) var(--motion-ease) forwards;
   pointer-events: none;
   overflow: hidden;
+  /* Override density-row fixed height so the collapse animation works */
+  min-height: 0 !important;
+  max-height: var(--density-row, 3rem) !important;
 }
 @keyframes email-row-exit {
+  from {
+    max-height: var(--density-row, 3rem);
+    opacity: 1;
+  }
   to {
     opacity: 0;
     max-height: 0;
@@ -875,5 +984,44 @@ textarea.bg-transparent:focus {
   }
   100% {
     transform: scale(1);
+  }
+}
+
+/* ── MD3 micro-motion: staggered mailbox rows ─────────────────────────────── */
+/* Runs once per mounted row (keyed {#each} keeps existing rows mounted, so
+   polling only animates genuinely new mail; tab switches replay it). */
+.mailbox-row-enter {
+  animation: mailbox-row-in 240ms var(--motion-ease, ease-out) both;
+}
+@keyframes mailbox-row-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ── MD3 micro-motion: count tick (per-inbox storage counts, etc.) ───────── */
+.count-tick {
+  animation: count-tick-in 200ms var(--motion-ease, ease-out);
+}
+@keyframes count-tick-in {
+  from {
+    opacity: 0.25;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mailbox-row-enter,
+  .count-tick {
+    animation: none;
   }
 }

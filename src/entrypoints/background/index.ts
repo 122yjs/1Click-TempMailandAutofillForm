@@ -1,21 +1,30 @@
 import { browser } from 'wxt/browser';
 import { defineBackground } from 'wxt/utils/define-background';
 import { SETTINGS_SYNC_KEYS } from '@/features/settings/use-extension-storage-sync.js';
-import { DEBUG } from '@/utils/constants.js';
-import { getCurrentLocale, preloadTranslations, tSync } from '@/utils/i18n-utils.js';
+import { processClipboardPurgeQueue } from '@/utils/clipboard.js';
+import {
+  DEBUG,
+  DEFAULT_PRIMARY_COLOR,
+  NEAR_EXPIRY_BADGE_COLOR,
+  NEAR_EXPIRY_BADGE_WINDOW_MS,
+} from '@/utils/constants.js';
+import { getStoredLocaleAsync, preloadTranslations, tSync } from '@/utils/i18n-utils.js';
 import { initializeDefaultProvider } from '@/utils/instance-manager.js';
 import { initLogger, log, logDebug, logError, logInfo } from '@/utils/logger.js';
+import { withLock } from '@/utils/mutex.js';
 import {
   addToAutofillBlocklist,
   getAutofillBlocklist,
   getSelectedProvider,
   removeFromAutofillBlocklist,
 } from '@/utils/storage-keys.js';
+import type { Account } from '@/utils/types.js';
 import { lockVault } from '@/utils/vault-lock.js';
 import { initializeAnalytics } from './inbox/analytics.js';
 import {
   checkNewEmails,
   createInbox,
+  ensureBadgeCountdownAlarm,
   setupInboxExpiryCheck,
   setupPeriodicEmailCheck,
 } from './inbox/inbox-manager.js';
@@ -41,26 +50,74 @@ async function setupUnreadBadge() {
       storedEmails = {},
       readEmails = {},
       customColor,
-    } = (await browser.storage.local.get(['storedEmails', 'readEmails', 'customColor'])) as {
+      inboxes = [],
+      activeInboxId,
+    } = (await browser.storage.local.get([
+      'storedEmails',
+      'readEmails',
+      'customColor',
+      'inboxes',
+      'activeInboxId',
+    ])) as {
       storedEmails?: Record<string, { id: string }[]>;
       readEmails?: Record<string, boolean>;
       customColor?: string;
+      inboxes?: Array<{ id?: string; expiresAt?: number; autoExtend?: boolean; status?: string }>;
+      activeInboxId?: string;
     };
+
+    // Near-expiry override: when the active inbox expires soon and auto-renew
+    // is disabled, show a live countdown ("45m") in amber instead of the unread
+    // count, so the "why did my inbox die?" loop is answered at a glance.
+    const now = Date.now();
+    const active =
+      inboxes.find((i) => i.id === activeInboxId) ||
+      inboxes.find((i) => i.status === 'active') ||
+      inboxes[0];
+    const expiresAt = active?.expiresAt;
+    if (
+      expiresAt &&
+      expiresAt > now &&
+      active?.autoExtend !== true &&
+      expiresAt - now <= NEAR_EXPIRY_BADGE_WINDOW_MS
+    ) {
+      const minutes = Math.max(1, Math.ceil((expiresAt - now) / 60000));
+      await browser.action.setBadgeBackgroundColor({ color: NEAR_EXPIRY_BADGE_COLOR });
+      await browser.action.setBadgeText({ text: `${minutes}m` });
+      return;
+    }
+
     let unread = 0;
     for (const [addr, msgs] of Object.entries(storedEmails)) {
+      if (!Array.isArray(msgs)) continue;
       unread += msgs.filter((m) => {
+        if (!m || typeof m !== 'object' || !m.id) return false;
         const mExt = m as { id: string; original_inbox?: string };
         const key = `${mExt.original_inbox || addr}_${m.id}`;
         return !readEmails[key] && !readEmails[m.id];
       }).length;
     }
-    await browser.action.setBadgeBackgroundColor({ color: customColor || '#4c662b' });
+    await browser.action.setBadgeBackgroundColor({ color: customColor || DEFAULT_PRIMARY_COLOR });
     await browser.action.setBadgeText({ text: unread > 0 ? String(unread) : '' });
   }
 
   // Update on every relevant storage change
   browser.storage.onChanged.addListener((changes) => {
-    if (changes.storedEmails || changes.readEmails || changes.customColor) {
+    if (
+      changes.storedEmails ||
+      changes.readEmails ||
+      changes.customColor ||
+      changes.inboxes ||
+      changes.activeInboxId
+    ) {
+      updateBadge().catch((e) => logError('updateBadge error', e));
+    }
+  });
+
+  // Keep the countdown fresh while the SW is alive (cheap read of a few keys).
+  void ensureBadgeCountdownAlarm();
+  browser.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === 'near_expiry_badge') {
       updateBadge().catch((e) => logError('updateBadge error', e));
     }
   });
@@ -81,6 +138,7 @@ async function getActiveInboxAddress(): Promise<string> {
     const active = list.find((i) => i.status === 'active' && i.address);
     return active?.address || list[0]?.address || '';
   } catch {
+    /* ignore */
     return '';
   }
 }
@@ -112,14 +170,23 @@ async function openExtensionView(view: string, extra?: Record<string, unknown>):
     /* openPopup often requires a user gesture / may be unavailable */
   }
   try {
-    const anyBrowser = browser as typeof browser & {
-      sidePanel?: { open: (opts: { windowId?: number }) => Promise<void> };
-    };
-    if (anyBrowser.sidePanel?.open) {
-      const win = await browser.windows.getCurrent();
-      if (win.id != null) {
-        await anyBrowser.sidePanel.open({ windowId: win.id });
-        return;
+    // Block side panel when the active tab is our full app page
+    const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+    const activeUrl = tabs[0]?.url || '';
+    const isOwnApp =
+      activeUrl.includes('/app.html') ||
+      /chrome-extension:\/\/[^/]+\/app\.html/i.test(activeUrl) ||
+      /moz-extension:\/\/[^/]+\/app\.html/i.test(activeUrl);
+    if (!isOwnApp) {
+      const anyBrowser = browser as typeof browser & {
+        sidePanel?: { open: (opts: { windowId?: number }) => Promise<void> };
+      };
+      if (anyBrowser.sidePanel?.open) {
+        const win = await browser.windows.getCurrent();
+        if (win.id != null) {
+          await anyBrowser.sidePanel.open({ windowId: win.id });
+          return;
+        }
       }
     }
   } catch {
@@ -134,40 +201,54 @@ async function openExtensionView(view: string, extra?: Record<string, unknown>):
   }
 }
 
+let isSettingUpContextMenu = false;
+
 /** Right-click on page + right-click on extension toolbar icon (action). */
 function setupContextMenu() {
+  if (isSettingUpContextMenu) return;
+  isSettingUpContextMenu = true;
+
   // Non-empty tuple required by @types/chrome ContextType[]
   const actionContexts: ['action'] = ['action'];
 
-  function createActionMenu(id: string, title: string, extra?: Record<string, unknown>) {
+  function safeCreateMenu(options: Record<string, unknown>) {
     try {
-      browser.contextMenus.create({
-        id,
-        title,
-        contexts: actionContexts,
-        ...extra,
-      } as Parameters<typeof browser.contextMenus.create>[0]);
+      browser.contextMenus.create(
+        options as Parameters<typeof browser.contextMenus.create>[0],
+        () => {
+          // Access runtime.lastError to mark it checked in Chrome engine
+          const _err =
+            browser.runtime.lastError ||
+            (globalThis as unknown as { chrome?: { runtime?: { lastError?: unknown } } }).chrome
+              ?.runtime?.lastError;
+        }
+      );
     } catch (e) {
-      logDebug(`contextMenus.create ${id} failed`, e);
+      logDebug(`contextMenus.create ${String(options.id)} failed`, e);
     }
   }
 
+  function createActionMenu(id: string, title: string, extra?: Record<string, unknown>) {
+    safeCreateMenu({
+      id,
+      title,
+      contexts: actionContexts,
+      ...extra,
+    });
+  }
+
   function sep(id: string) {
-    try {
-      browser.contextMenus.create({
-        id,
-        type: 'separator',
-        contexts: actionContexts,
-      } as Parameters<typeof browser.contextMenus.create>[0]);
-    } catch {
-      /* ignore */
-    }
+    safeCreateMenu({
+      id,
+      type: 'separator',
+      contexts: actionContexts,
+    });
   }
 
   browser.contextMenus
     .removeAll()
     .then(async () => {
-      await preloadTranslations(await getCurrentLocale());
+      await preloadTranslations(await getStoredLocaleAsync());
       const addr = (await getActiveInboxAddress()) || tSync('contextMenu.noAddressYet');
 
       // —— Extension icon (toolbar) menu ——
@@ -195,22 +276,22 @@ function setupContextMenu() {
 
       // —— Page context menu ——
       try {
-        browser.contextMenus.create({
+        safeCreateMenu({
           id: 'create-temp-email',
           title: tSync('contextMenu.createTempEmail'),
           contexts: ['page', 'link', 'editable'],
         });
-        browser.contextMenus.create({
+        safeCreateMenu({
           id: 'separator-autofill',
           type: 'separator',
           contexts: ['page'],
         });
-        browser.contextMenus.create({
+        safeCreateMenu({
           id: 'page-autofill-form',
           title: tSync('contextMenu.autofillThisPage'),
           contexts: ['page', 'editable'],
         });
-        browser.contextMenus.create({
+        safeCreateMenu({
           id: 'autofill-toggle-blocklist',
           title: tSync('contextMenu.excludeFromAutofill'),
           contexts: ['page'],
@@ -219,7 +300,10 @@ function setupContextMenu() {
         logDebug('page context menus failed', e);
       }
     })
-    .catch((e) => logError('contextMenus.removeAll failed', e));
+    .catch((e) => logError('contextMenus.removeAll failed', e))
+    .finally(() => {
+      isSettingUpContextMenu = false;
+    });
 
   async function refreshActionEmailTitle() {
     try {
@@ -240,11 +324,15 @@ function setupContextMenu() {
         .filter((i) => i.address && i.accountStatus !== 'deleted')
         .slice(0, 8);
 
+      const removePromises: Promise<void>[] = [];
       for (let i = 0; i < 12; i++) {
-        await browser.contextMenus.remove(`action-address-item-${i}`).catch(() => {});
+        removePromises.push(
+          browser.contextMenus.remove(`action-address-item-${i}`).catch(() => {})
+        );
       }
-      await browser.contextMenus.remove('action-address-empty').catch(() => {});
-      await browser.contextMenus.remove('action-addresses-parent').catch(() => {});
+      removePromises.push(browser.contextMenus.remove('action-address-empty').catch(() => {}));
+      removePromises.push(browser.contextMenus.remove('action-addresses-parent').catch(() => {}));
+      await Promise.all(removePromises);
 
       if (list.length === 0) {
         createActionMenu('action-address-empty', tSync('contextMenu.noAddressesYet'), {
@@ -294,6 +382,24 @@ function setupContextMenu() {
 
   browser.tabs.onActivated.addListener((activeInfo) => {
     updateContextMenuForTab(activeInfo.tabId).catch(() => {});
+    // Side panel follows the active tab. When the active tab leaves the app
+    // page, the app-page conflict is gone — clear the open flag so a later
+    // visit to app.html doesn't show the overlay spuriously.
+    void (async () => {
+      try {
+        const tab = await browser.tabs.get(activeInfo.tabId);
+        const url = tab?.url || '';
+        const onApp = /(chrome|moz)-extension:\/\/[^/]+\/app\.html/i.test(url);
+        if (!onApp) {
+          const { sidePanelOpen } = (await browser.storage.local.get(['sidePanelOpen'])) as {
+            sidePanelOpen?: boolean;
+          };
+          if (sidePanelOpen) await browser.storage.local.set({ sidePanelOpen: false });
+        }
+      } catch {
+        /* ignore */
+      }
+    })();
   });
 
   browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
@@ -301,7 +407,20 @@ function setupContextMenu() {
       updateContextMenuForTab(tabId).catch(() => {});
     }
     if (changeInfo.url) {
-      browser.storage.session.remove('sessionCredentials').catch(() => {});
+      void withLock('session_credentials_lock', async () => {
+        try {
+          const res = (await browser.storage.session.get('sessionCredentials')) as {
+            sessionCredentials?: Record<string, unknown>;
+          };
+          const creds = res.sessionCredentials;
+          if (creds?.[tabId]) {
+            delete creds[tabId];
+            await browser.storage.session.set({ sessionCredentials: creds });
+          }
+        } catch (e: unknown) {
+          logError('Failed to remove session credentials on navigation', e);
+        }
+      });
     }
   });
 
@@ -314,6 +433,7 @@ function setupContextMenu() {
   });
 
   browser.contextMenus.onClicked.addListener(async (info, tab) => {
+    browser.storage.session.set({ _last_vault_activity: Date.now() }).catch(() => {});
     const id = String(info.menuItemId);
 
     if (id === 'action-autofill-page' || id === 'page-autofill-form') {
@@ -332,7 +452,9 @@ function setupContextMenu() {
             title: 'Autofill',
             message: msg,
           })
-          .catch(() => {});
+          .catch(() => {
+            /* ignore notification permission or display failure */
+          });
       }
       return;
     }
@@ -346,24 +468,32 @@ function setupContextMenu() {
         try {
           await browser.storage.local.set({
             activeInboxId: inbox.id,
-            openView: 'main',
+            openView: 'mailbox',
             openViewAt: Date.now(),
           });
           await browser.storage.session.set({
-            openView: 'main',
+            openView: 'mailbox',
             openViewAt: Date.now(),
           });
         } catch {
-          /* ignore */
+          /* ignore storage write error */
         }
-        if (tab?.id) {
+        if (tab?.id !== undefined) {
           await browser.scripting
             .executeScript({
               target: { tabId: tab.id },
-              func: (text: string) => navigator.clipboard.writeText(text),
+              func: (text: string) => {
+                navigator.clipboard.writeText(text).catch(() => {});
+                // Schedule auto-purge in the page context (best-effort; page-scoped)
+                setTimeout(() => {
+                  navigator.clipboard.writeText('').catch(() => {});
+                }, 60000);
+              },
               args: [inbox.address],
             })
-            .catch(() => {});
+            .catch(() => {
+              /* ignore executeScript failure if tab permissions restricted or closed */
+            });
           const status = await ensureTabAutofillReady(tab.id, {
             notifyIfRefreshNeeded: true,
           });
@@ -375,7 +505,9 @@ function setupContextMenu() {
                 title: 'Temp email ready',
                 message: `${inbox.address}\nSignup form detected — use Autofill this page or the on-page button.`,
               })
-              .catch(() => {});
+              .catch(() => {
+                /* ignore notification permission or display failure */
+              });
           } else {
             browser.notifications
               .create(`ctx_${inbox.address}`, {
@@ -384,7 +516,9 @@ function setupContextMenu() {
                 title: 'Temp Email Created',
                 message: `${inbox.address}\nCopied to clipboard!`,
               })
-              .catch(() => {});
+              .catch(() => {
+                /* ignore notification permission or display failure */
+              });
           }
         } else {
           browser.notifications
@@ -394,7 +528,9 @@ function setupContextMenu() {
               title: 'Temp Email Created',
               message: `${inbox.address}`,
             })
-            .catch(() => {});
+            .catch(() => {
+              /* ignore notification permission or display failure */
+            });
         }
         await refreshActionEmailTitle();
         await rebuildAddressSubmenu();
@@ -405,7 +541,7 @@ function setupContextMenu() {
           /* gesture may be consumed */
         }
       } catch (e) {
-        if (DEBUG) log(`Context menu createInbox error: ${e}`);
+        logError('Context menu createInbox error', e);
       }
       return;
     }
@@ -439,6 +575,17 @@ function setupContextMenu() {
 
     if (id === 'action-open-sidepanel') {
       try {
+        // Never open side panel when the active tab is our own full app page
+        const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+        const activeUrl = tabs[0]?.url || '';
+        if (
+          activeUrl.includes('/app.html') ||
+          /chrome-extension:\/\/[^/]+\/app\.html/i.test(activeUrl) ||
+          /moz-extension:\/\/[^/]+\/app\.html/i.test(activeUrl)
+        ) {
+          logDebug('Side panel blocked on app.html tab');
+          return;
+        }
         // Re-enable side panel if app tab disabled it; never steal toolbar click from popup
         await configureToolbarDefaultUi({ enableSidePanel: true });
         const chromeApi = (
@@ -455,6 +602,9 @@ function setupContextMenu() {
         const win = await browser.windows.getCurrent();
         if (win.id != null && openFn) {
           await openFn({ windowId: win.id });
+          // Track side-panel open state so the app page can detect the conflict
+          // and show its "close side panel to unlock" overlay.
+          await browser.storage.local.set({ sidePanelOpen: true });
         }
       } catch (e) {
         logError('Failed to open side panel', e);
@@ -481,11 +631,11 @@ function setupContextMenu() {
         if (!inboxId) return;
         await browser.storage.local.set({
           activeInboxId: inboxId,
-          openView: 'main',
+          openView: 'mailbox',
           openViewAt: Date.now(),
         });
-        await browser.storage.session.set({ openView: 'main', openViewAt: Date.now() });
-        await openExtensionView('main');
+        await browser.storage.session.set({ openView: 'mailbox', openViewAt: Date.now() });
+        await openExtensionView('mailbox');
       } catch (e) {
         logDebug('open mailbox from menu failed', e);
       }
@@ -625,6 +775,7 @@ function setupOmnibox() {
   });
 
   browser.omnibox.onInputEntered.addListener((text, disposition) => {
+    browser.storage.session.set({ _last_vault_activity: Date.now() }).catch(() => {});
     void (async () => {
       const cmd = (text || '').trim().toLowerCase();
       if (cmd === 'fill' || cmd === 'autofill') {
@@ -642,7 +793,7 @@ function setupOmnibox() {
         return;
       }
       if (cmd === 'mailbox' || cmd === 'mail') {
-        await openExtensionView('main');
+        await openExtensionView('mailbox');
         return;
       }
       if (cmd === 'settings') {
@@ -675,6 +826,7 @@ function setupStorageSyncMirror(): void {
       const res = await browser.storage.session.get('_sync_mirroring_lock');
       return !!res._sync_mirroring_lock;
     } catch {
+      /* ignore */
       return false;
     }
   }
@@ -756,8 +908,10 @@ function setupVaultAutoLockCheck(): void {
           const sessionRes = (await browser.storage.session.get(['_last_vault_activity'])) as {
             _last_vault_activity?: number;
           };
-          const lastActivity = sessionRes._last_vault_activity || Date.now();
-          if (Date.now() - lastActivity > 15 * 60 * 1000) {
+          if (
+            sessionRes._last_vault_activity &&
+            Date.now() - sessionRes._last_vault_activity > 15 * 60 * 1000
+          ) {
             await lockVault();
             logInfo('Vault auto-locked due to 15 minutes of inactivity.');
           }
@@ -765,6 +919,29 @@ function setupVaultAutoLockCheck(): void {
           logError('Failed during vault auto-lock check', err);
         }
       })();
+    }
+  });
+}
+
+/**
+ * Background alarm that periodically checks the clipboard-purge queue
+ * and clears sensitive clipboard data. This is a fallback for when the
+ * page/context that initiated a copy is destroyed before its page-scoped
+ * setTimeout fires (e.g., popup closed, tab navigated).
+ */
+function setupClipboardPurgeAlarm(): void {
+  browser.alarms
+    .get('clipboard_purge_check')
+    .then((alarm) => {
+      if (!alarm) {
+        browser.alarms.create('clipboard_purge_check', { periodInMinutes: 1 });
+      }
+    })
+    .catch((e) => logError('alarms.get failed', e));
+
+  browser.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === 'clipboard_purge_check') {
+      void processClipboardPurgeQueue();
     }
   });
 }
@@ -917,6 +1094,7 @@ export default defineBackground(() => {
   setupOmnibox();
   setupStorageSyncMirror();
   setupVaultAutoLockCheck();
+  setupClipboardPurgeAlarm();
 
   browser.runtime.onInstalled.addListener((details: { reason: string }) => {
     if (DEBUG) logDebug(`Extension installed/updated: ${details.reason}`);
@@ -950,20 +1128,67 @@ export default defineBackground(() => {
     /* onStartup may be unavailable */
   }
 
-  // Commands: open autofill manager
+  // Commands: open autofill manager, quick generate, copy latest OTP
   try {
     browser.commands.onCommand.addListener((command) => {
+      browser.storage.session.set({ _last_vault_activity: Date.now() }).catch(() => {});
       if (command === 'open-autofill-manager') {
         void openExtensionView('autofill');
+      } else if (command === 'quick-generate-inbox') {
+        void (async () => {
+          try {
+            const acc = (await createInbox()) as Account;
+            if (acc?.address) {
+              await browser.notifications.create(`quick_gen_${Date.now()}`, {
+                type: 'basic',
+                iconUrl: 'icons/icon48.png',
+                title: 'Temp Mail Generated',
+                message: `Created: ${acc.address}`,
+              });
+            }
+          } catch (e) {
+            logError('Failed quick generate shortcut', e);
+          }
+        })();
+      } else if (command === 'copy-latest-otp') {
+        void (async () => {
+          try {
+            const res = await browser.storage.session.get(['_latest_otp_code']);
+            const otp = (res._latest_otp_code as string) || '';
+            if (otp) {
+              await browser.notifications.create(`otp_copied_${Date.now()}`, {
+                type: 'basic',
+                iconUrl: 'icons/icon48.png',
+                title: 'Latest OTP',
+                message: `OTP Code: ${otp}`,
+              });
+            }
+          } catch (e) {
+            logError('Failed copy latest OTP shortcut', e);
+          }
+        })();
       }
     });
   } catch {
     /* commands optional */
   }
 
-  // Handle notification clicks - open extension and navigate to email
+  // Handle notification clicks - open extension or direct Magic Link tab
   browser.notifications.onClicked.addListener(async (notificationId: string) => {
+    browser.storage.session.set({ _last_vault_activity: Date.now() }).catch(() => {});
     if (DEBUG) log(`Notification clicked: ${notificationId}`);
+
+    if (notificationId.startsWith('magiclink:')) {
+      const parts = notificationId.split(':');
+      if (parts.length >= 4) {
+        const rawUrl = parts.slice(3).join(':');
+        const magicUrl = decodeURIComponent(rawUrl);
+        if (magicUrl.startsWith('http')) {
+          await browser.tabs.create({ url: magicUrl });
+          return;
+        }
+      }
+    }
 
     // Parse notification ID to extract email ID and inbox ID
     // Format: email:{emailId}:{inboxId}
@@ -997,7 +1222,9 @@ export default defineBackground(() => {
         if (v) setOtpDetectionMode(v);
       }
       if (changes.selectedIdentityId || changes.identities) {
-        updateUserAgentSessionRule().catch(() => {});
+        updateUserAgentSessionRule().catch((err) =>
+          logError('updateUserAgentSessionRule failed', err)
+        );
       }
     }
   });
@@ -1008,13 +1235,15 @@ export default defineBackground(() => {
       await initLogger().catch(() => {});
       if (DEBUG) log('=== BACKGROUND SCRIPT STARTED ===');
       await syncOtpDetectionMode();
-      await updateUserAgentSessionRule().catch(() => {});
+      await updateUserAgentSessionRule().catch((err) =>
+        logError('updateUserAgentSessionRule startup failed', err)
+      );
 
       initializeAnalytics();
       initializeDefaultProvider();
 
       // Preload translations for current locale (async, non-blocking for events)
-      const locale = await getCurrentLocale();
+      const locale = await getStoredLocaleAsync();
       await preloadTranslations(locale);
       // Also preload English as fallback
       if (locale !== 'en') {

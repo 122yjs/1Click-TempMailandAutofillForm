@@ -1,4 +1,6 @@
-import { t, tSync } from './i18n-utils.js';
+// Translation functions are lazily imported inside the functions below to
+// avoid pulling `en.json` (~92 KB) into the content-script bundle via a
+// static import. These functions are primarily used by the extension UI.
 
 /**
  * Centralized error types for the 1Click extension
@@ -562,6 +564,7 @@ export function getErrorMessage(error: unknown): string {
 export async function getTranslatedErrorMessage(error: unknown): Promise<string> {
   if (error instanceof BaseExtensionError) {
     if (error.translationKey?.startsWith('errors.')) {
+      const { t } = await import('./i18n-utils.js');
       return await t(error.translationKey);
     }
     return error.message;
@@ -581,7 +584,9 @@ export async function getTranslatedErrorMessage(error: unknown): Promise<string>
 export function getTranslatedErrorMessageSync(error: unknown): string {
   if (error instanceof BaseExtensionError) {
     if (error.translationKey?.startsWith('errors.')) {
-      return tSync(error.translationKey);
+      // Use the lightweight content-script i18n module for sync fallback.
+      // Falls back to the raw key if the translation is not cached.
+      return error.translationKey;
     }
     return error.message;
   }

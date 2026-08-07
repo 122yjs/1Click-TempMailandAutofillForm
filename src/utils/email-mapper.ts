@@ -1,8 +1,8 @@
 import { extractMagicLinks } from '@/entrypoints/background/parsing/magic-link.js';
 import { logDebug } from '@/utils/logger.js';
 import { estimateExpiresAt } from '@/utils/otp-magic-expiry.js';
-import { htmlToPlainText, initSanitize, sanitizeHtml } from '@/utils/sanitize-html.js';
-import { timeAgo } from '@/utils/time.js';
+import { htmlToPlainText, initSanitize } from '@/utils/sanitize-html.js';
+import { timeAgo } from '@/utils/time-format.js';
 import type { Email, MagicLink } from '@/utils/types.js';
 
 // Preload DOMPurify so sanitizeHtml() is ready when emails arrive.
@@ -16,6 +16,7 @@ function resolveMagicLinks(m: Email): MagicLink[] {
   try {
     return extractMagicLinks(m.subject || '', m.body_html || '', m.body_plain || m.body || '');
   } catch {
+    /* ignore */
     return [];
   }
 }
@@ -23,7 +24,8 @@ function resolveMagicLinks(m: Email): MagicLink[] {
 export function mapEmailForDisplay(
   m: Email,
   readEmails: Record<string, boolean>,
-  addr: string = ''
+  addr: string = '',
+  messageRetentionMs?: number
 ): Email {
   const bodyPlain = m.body_plain || htmlToPlainText(m.body_html || m.body || '');
   const receivedMs =
@@ -41,6 +43,11 @@ export function mapEmailForDisplay(
         undefined,
     }));
   }
+  // Retention window comes from the provider config (pass it in) so the display
+  // layer never drifts from the configured messageRetentionDuration. Fall back
+  // to 1 hour for legacy messages that predate the config.
+  const retentionMs = messageRetentionMs ?? 60 * 60 * 1000;
+  const messageExpiresAt = m.messageExpiresAt || receivedMs + retentionMs;
   return {
     id: m.id,
     from:
@@ -51,10 +58,12 @@ export function mapEmailForDisplay(
     isOtp: !!m.otp,
     otp: m.otp || null,
     otpExpiresAt,
+    messageExpiresAt,
     magicLinks: magicLinks.length > 0 ? magicLinks : undefined,
     hasMagicLink: magicLinks.length > 0,
     body: bodyPlain,
-    body_html: m.body_html ? sanitizeHtml(m.body_html) : m.body_html,
+    body_html: m.body_html,
+    raw_source: m.raw_source,
     unread: !readEmails[`${m.original_inbox || addr}_${m.id}`] && !readEmails[m.id],
     received_at: m.received_at,
     local_only: m.local_only,
@@ -65,15 +74,17 @@ export function mapEmailForDisplay(
     local_deleted: m.local_deleted,
     local_deleted_at: m.local_deleted_at,
     stored_at: m.stored_at,
+    attachments: Array.isArray(m.attachments) ? m.attachments : undefined,
   } as Email;
 }
 
 export function mapEmailsForDisplay(
   msgs: Email[],
   readEmails: Record<string, boolean>,
-  addr: string = ''
+  addr: string = '',
+  messageRetentionMs?: number
 ): Email[] {
-  return msgs.map((m) => mapEmailForDisplay(m, readEmails, addr));
+  return msgs.map((m) => mapEmailForDisplay(m, readEmails, addr, messageRetentionMs));
 }
 
 export interface OtpExtractionResult {

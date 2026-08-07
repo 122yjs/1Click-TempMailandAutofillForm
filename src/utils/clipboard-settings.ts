@@ -33,6 +33,7 @@ export async function loadClipboardPrivacy(): Promise<ClipboardPrivacySettings> 
           : DEFAULT_CLIPBOARD_PRIVACY.purgeAfterSeconds,
     };
   } catch {
+    /* ignore */
     return { ...DEFAULT_CLIPBOARD_PRIVACY };
   }
 }

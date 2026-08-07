@@ -82,7 +82,8 @@ function parseLogLevel(level: string): LogLevel {
  */
 function formatLogEntry(entry: LogEntry): string {
   const levelName = LogLevel[entry.level];
-  const timestamp = entry.timestamp;
+  const ts = new Date(entry.timestamp);
+  const timestamp = `${ts.getFullYear()}-${String(ts.getMonth() + 1).padStart(2, '0')}-${String(ts.getDate()).padStart(2, '0')} ${String(ts.getHours()).padStart(2, '0')}:${String(ts.getMinutes()).padStart(2, '0')}:${String(ts.getSeconds()).padStart(2, '0')}.${String(ts.getMilliseconds()).padStart(3, '0')}`;
   const contextStr = entry.context ? ` ${JSON.stringify(entry.context)}` : '';
   const errorStr = entry.error ? ` Error: ${entry.error.message}` : '';
   return `[${timestamp}] [${levelName}] ${entry.message}${contextStr}${errorStr}`;
@@ -129,7 +130,14 @@ function internalLog(level: LogLevel, message: string, context?: LogContext, err
  * Debug level log - only logs if enabled and level is DEBUG or lower
  */
 export function logDebug(message: string, context?: LogContext | unknown): void {
-  const safeContext = context && typeof context === 'object' ? (context as LogContext) : undefined;
+  // If an Error was passed (common misuse), extract its message/stack so it's
+  // not lost as "{}" when JSON.stringify hits non-enumerable Error props.
+  let safeContext: LogContext | undefined;
+  if (context instanceof Error) {
+    safeContext = { error: context.message, stack: context.stack };
+  } else {
+    safeContext = context && typeof context === 'object' ? (context as LogContext) : undefined;
+  }
   internalLog(LogLevel.DEBUG, message, safeContext);
 }
 
@@ -137,7 +145,12 @@ export function logDebug(message: string, context?: LogContext | unknown): void 
  * Info level log - only logs if enabled and level is INFO or lower
  */
 export function logInfo(message: string, context?: LogContext | unknown): void {
-  const safeContext = context && typeof context === 'object' ? (context as LogContext) : undefined;
+  let safeContext: LogContext | undefined;
+  if (context instanceof Error) {
+    safeContext = { error: context.message, stack: context.stack };
+  } else {
+    safeContext = context && typeof context === 'object' ? (context as LogContext) : undefined;
+  }
   internalLog(LogLevel.INFO, message, safeContext);
 }
 
@@ -145,7 +158,12 @@ export function logInfo(message: string, context?: LogContext | unknown): void {
  * Warn level log - only logs if enabled and level is WARN or lower
  */
 export function logWarn(message: string, context?: LogContext | unknown): void {
-  const safeContext = context && typeof context === 'object' ? (context as LogContext) : undefined;
+  let safeContext: LogContext | undefined;
+  if (context instanceof Error) {
+    safeContext = { error: context.message, stack: context.stack };
+  } else {
+    safeContext = context && typeof context === 'object' ? (context as LogContext) : undefined;
+  }
   internalLog(LogLevel.WARN, message, safeContext);
 }
 
@@ -153,6 +171,14 @@ export function logWarn(message: string, context?: LogContext | unknown): void {
  * Error level log - always logs regardless of setting
  */
 export function logError(message: string, context?: LogContext | unknown, error?: Error): void {
+  // Auto-detect when an Error is mistakenly passed as the 2nd-arg (context) —
+  // a pattern found at 123 call sites across the codebase — and shift it to the
+  // 3rd-arg (error) position so stack traces are preserved instead of being
+  // JSON-stringified as "{}" (Error has no enumerable own props).
+  if (context instanceof Error) {
+    error = context;
+    context = undefined;
+  }
   const safeContext = context && typeof context === 'object' ? (context as LogContext) : undefined;
   internalLog(LogLevel.ERROR, message, safeContext, error);
 }

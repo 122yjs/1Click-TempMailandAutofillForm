@@ -34,6 +34,13 @@ export default defineConfig({
   // Expect timeout for individual assertions
   expect: { timeout: 10_000 },
 
+  webServer: {
+    command: 'bun scripts/demo-server.ts',
+    url: 'http://localhost:5173/demo/signup-social.html',
+    reuseExistingServer: !process.env.CI,
+    timeout: 10_000,
+  },
+
   use: {
     // No baseURL — tests use chrome-extension:// URLs resolved via fixtures.ts
     trace: 'on-first-retry',

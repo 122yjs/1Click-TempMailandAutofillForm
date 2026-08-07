@@ -1,4 +1,5 @@
 import { browser } from 'wxt/browser';
+import { PBKDF2_ITERATIONS } from './constants.js';
 import {
   clearCachedMasterKey,
   decryptMasterKeyWithPassword,
@@ -15,9 +16,19 @@ export interface VaultConfig {
   salt?: string;
   encryptedMasterKey?: string;
   biometricCredentialId?: string;
+  /** PBKDF2 iteration count used to derive the master key (legacy records omit it). */
+  iterations?: number;
 }
 
 const VAULT_CONFIG_KEY = 'vault_security_config';
+
+/** Session storage key for brute-force lockout state */
+const VAULT_LOCKOUT_KEY = 'vault_unlock_lockout';
+
+/** Max attempts before lockout. Lockout duration doubles each tier. */
+const VAULT_MAX_ATTEMPTS = 5;
+/** Lockout durations in ms: 30s, 5m, 30m, 2h, 12h */
+const VAULT_LOCKOUT_DURATIONS = [30_000, 300_000, 1_800_000, 7_200_000, 43_200_000];
 
 /**
  * Check if WebAuthn platform authenticator (Windows Hello / Touch ID) is supported.
@@ -29,6 +40,7 @@ export async function isBiometricSupported(): Promise<boolean> {
     }
     return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
   } catch {
+    /* ignore */
     return false;
   }
 }
@@ -43,6 +55,7 @@ export async function getVaultConfig(): Promise<VaultConfig> {
     };
     return res[VAULT_CONFIG_KEY] || { mode: 'standard' };
   } catch {
+    /* ignore */
     return { mode: 'standard' };
   }
 }
@@ -69,6 +82,7 @@ export async function isVaultLocked(): Promise<boolean> {
     };
     return !sessionRes[MASTER_KEY_ID];
   } catch {
+    /* ignore */
     return true;
   }
 }
@@ -89,13 +103,19 @@ export async function setupMasterPassword(password: string): Promise<boolean> {
     const salt = Array.from(saltBytes)
       .map((b) => b.toString(16).padStart(2, '0'))
       .join('');
-    const encryptedMasterKey = await encryptMasterKeyWithPassword(keyJson, password, salt);
+    const encryptedMasterKey = await encryptMasterKeyWithPassword(
+      keyJson,
+      password,
+      salt,
+      PBKDF2_ITERATIONS
+    );
 
     // 3. Store encrypted master key & config, remove raw master key from local storage
     const config: VaultConfig = {
       mode: 'password',
       salt,
       encryptedMasterKey,
+      iterations: PBKDF2_ITERATIONS,
     };
     await saveVaultConfig(config);
 
@@ -114,29 +134,78 @@ export async function setupMasterPassword(password: string): Promise<boolean> {
 
 /**
  * Unlock Vault using Master Password.
+ * Implements brute-force protection: 5 failed attempts triggers an exponentially
+ * increasing lockout (30s → 5min → 30min → 2h → 12h).
  */
-export async function unlockVaultWithPassword(password: string): Promise<boolean> {
+export async function unlockVaultWithPassword(password: string): Promise<{
+  success: boolean;
+  lockedOutUntil?: number;
+}> {
   try {
+    // ── Brute-force lockout check ─────────────────────────────────────────
+    const lockoutRes = (await browser.storage.local
+      .get([VAULT_LOCKOUT_KEY])
+      .catch(() => ({}))) as Record<string, unknown>;
+    const lockout = lockoutRes[VAULT_LOCKOUT_KEY] as
+      | { attempts: number; lockedUntil: number; tier: number }
+      | undefined;
+
+    const now = Date.now();
+    if (lockout?.lockedUntil && lockout.lockedUntil > now) {
+      logError('Vault unlock blocked — lockout active', undefined, undefined);
+      return { success: false, lockedOutUntil: lockout.lockedUntil };
+    }
+
+    // ── Attempt unlock ────────────────────────────────────────────────────
     const config = await getVaultConfig();
     if (!config.salt || !config.encryptedMasterKey) {
-      return false;
+      return { success: false };
     }
 
     const keyJson = await decryptMasterKeyWithPassword(
       config.encryptedMasterKey,
       password,
-      config.salt
+      config.salt,
+      config.iterations ?? PBKDF2_ITERATIONS
     );
+
     if (!keyJson) {
-      return false;
+      // ── Record failed attempt ──────────────────────────────────────────
+      const prevAttempts = (lockout?.attempts ?? 0) + 1;
+      const prevTier = lockout?.tier ?? 0;
+      if (prevAttempts >= VAULT_MAX_ATTEMPTS) {
+        const tier = Math.min(prevTier + 1, VAULT_LOCKOUT_DURATIONS.length - 1);
+        const duration = VAULT_LOCKOUT_DURATIONS[tier];
+        await browser.storage.local
+          .set({
+            [VAULT_LOCKOUT_KEY]: {
+              attempts: prevAttempts,
+              lockedUntil: now + duration,
+              tier,
+            },
+          })
+          .catch(() => {});
+        return { success: false, lockedOutUntil: now + duration };
+      }
+      await browser.storage.local
+        .set({
+          [VAULT_LOCKOUT_KEY]: {
+            attempts: prevAttempts,
+            lockedUntil: 0,
+            tier: prevTier,
+          },
+        })
+        .catch(() => {});
+      return { success: false };
     }
 
-    // Write decrypted master key to session storage
+    // ── Success: clear lockout, store key ─────────────────────────────────
+    await browser.storage.local.remove(VAULT_LOCKOUT_KEY as string).catch(() => {});
     await browser.storage.session.set({ [MASTER_KEY_ID]: keyJson });
-    return true;
+    return { success: true };
   } catch (error) {
     logError('Failed to unlock vault with password', error);
-    return false;
+    return { success: false };
   }
 }
 
@@ -226,9 +295,10 @@ export async function setupBiometricVault(): Promise<boolean> {
     }
 
     const firstVal = prfResults.results.first;
-    const firstBuffer =
-      firstVal instanceof ArrayBuffer ? firstVal : (firstVal as ArrayBufferView).buffer;
-    const secretBytes = new Uint8Array(firstBuffer);
+    const secretBytes =
+      firstVal instanceof ArrayBuffer
+        ? new Uint8Array(firstVal)
+        : new Uint8Array(firstVal.buffer, firstVal.byteOffset, firstVal.byteLength);
     const secretHex = Array.from(secretBytes)
       .map((b) => b.toString(16).padStart(2, '0'))
       .join('');
@@ -239,13 +309,19 @@ export async function setupBiometricVault(): Promise<boolean> {
     const keyJson = JSON.stringify(exportedKey);
 
     // 2. Encrypt master key with the derived cryptographic secret
-    const encryptedMasterKey = await encryptMasterKeyWithPassword(keyJson, secretHex, salt);
+    const encryptedMasterKey = await encryptMasterKeyWithPassword(
+      keyJson,
+      secretHex,
+      salt,
+      PBKDF2_ITERATIONS
+    );
 
     const config: VaultConfig = {
       mode: 'biometrics',
       salt,
       encryptedMasterKey,
       biometricCredentialId: credIdHex,
+      iterations: PBKDF2_ITERATIONS,
     };
     await saveVaultConfig(config);
 
@@ -271,13 +347,15 @@ export async function unlockVaultWithBiometrics(): Promise<boolean> {
     }
 
     const challenge = crypto.getRandomValues(new Uint8Array(32));
-    const credIdBytes = new Uint8Array(
-      config.biometricCredentialId.match(/.{1,2}/g)?.map((byte) => parseInt(byte, 16)) || []
-    );
-
-    const saltBytes = new Uint8Array(
-      config.salt.match(/.{1,2}/g)?.map((byte) => parseInt(byte, 16)) || []
-    );
+    const credIdArr =
+      config.biometricCredentialId.match(/.{1,2}/g)?.map((byte) => parseInt(byte, 16)) ?? [];
+    const saltArr = config.salt.match(/.{1,2}/g)?.map((byte) => parseInt(byte, 16)) ?? [];
+    if (credIdArr.length === 0 || saltArr.length === 0) {
+      logError('Invalid biometric credential ID or salt format');
+      return false;
+    }
+    const credIdBytes = new Uint8Array(credIdArr);
+    const saltBytes = new Uint8Array(saltArr);
 
     const assertion = await navigator.credentials.get({
       publicKey: {
@@ -309,9 +387,10 @@ export async function unlockVaultWithBiometrics(): Promise<boolean> {
     }
 
     const firstVal = prfResults.results.first;
-    const firstBuffer =
-      firstVal instanceof ArrayBuffer ? firstVal : (firstVal as ArrayBufferView).buffer;
-    const secretBytes = new Uint8Array(firstBuffer);
+    const secretBytes =
+      firstVal instanceof ArrayBuffer
+        ? new Uint8Array(firstVal)
+        : new Uint8Array(firstVal.buffer, firstVal.byteOffset, firstVal.byteLength);
     const secretHex = Array.from(secretBytes)
       .map((b) => b.toString(16).padStart(2, '0'))
       .join('');
@@ -320,7 +399,8 @@ export async function unlockVaultWithBiometrics(): Promise<boolean> {
     const keyJson = await decryptMasterKeyWithPassword(
       config.encryptedMasterKey,
       secretHex,
-      config.salt
+      config.salt,
+      config.iterations ?? PBKDF2_ITERATIONS
     );
     if (!keyJson) return false;
 
@@ -358,6 +438,7 @@ export async function lockVault(): Promise<void> {
   try {
     clearCachedMasterKey();
     await browser.storage.session.remove([MASTER_KEY_ID]);
+    browser.runtime.sendMessage({ type: 'vaultLocked' }).catch(() => {});
   } catch (error) {
     logError('Failed to lock vault', error);
   }

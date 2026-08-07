@@ -103,10 +103,12 @@ async function pingUrl(url: string): Promise<{ ms: number | 'timeout'; reliable:
       // Opaque success is unreliable — mark timeout so health graph prefers real probes
       return { ms: 'timeout', reliable: false };
     } catch {
+      /* ignore */
       clearTimeout(timeoutId);
       return { ms: 'timeout', reliable: false };
     }
   } catch {
+    /* ignore */
     clearTimeout(timeoutId);
     return { ms: 'timeout', reliable: false };
   }

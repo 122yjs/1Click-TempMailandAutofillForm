@@ -24,9 +24,8 @@ export function fabKindForView(
   opts?: { organizeTab?: OrganizeTabKind }
 ): SidebarFabKind {
   switch (view) {
-    case 'main':
-    case 'mailSettings':
-    case 'mailboxManagement':
+    case 'mailbox':
+    case 'addresses':
       return 'createAddress';
     case 'identities':
     case 'autofill':
@@ -43,20 +42,21 @@ export function fabKindForView(
       return 'createLabel';
     case 'filtersManagement':
       return 'createFilter';
+    case 'automation':
+      return 'ghost';
     case 'loginInfo':
       return 'ghostLogin';
-    case 'messageDetail':
+    case 'mailView':
       return 'ghostExpand';
     case 'settings':
     case 'about':
     case 'analytics':
-    case 'emailDetail':
+    case 'addressView':
     case 'keybindings':
     case 'mailProvider':
     case 'constantsSettings':
     case 'diagnostics':
     case 'storagePerformance':
-    case 'archivedEmails':
       return 'ghost';
     default:
       return 'ghost';
@@ -85,7 +85,7 @@ export function fabLabelKeyForKind(kind: SidebarFabKind): string {
     case 'refresh':
       return 'nav.fabRefresh';
     case 'createAddress':
-      return 'nav.fabCreateAddress';
+      return 'account.newMailAddress';
     case 'createIdentity':
       return 'nav.fabCreateIdentity';
     case 'createTag':
@@ -101,6 +101,6 @@ export function fabLabelKeyForKind(kind: SidebarFabKind): string {
     case 'ghost':
       return 'nav.fabScrollTop';
     default:
-      return 'nav.fabCreateAddress';
+      return 'account.newMailAddress';
   }
 }

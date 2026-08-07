@@ -9,10 +9,19 @@ import type { Email } from '@/utils/types.js';
 export interface EmailFilterOptions {
   searchQuery?: string;
   otpOnly?: boolean;
+  hasAttachment?: boolean;
   senderDomain?: string;
   senderEmail?: string;
   recipient?: string;
   subject?: string;
+  /** Exclude emails from this sender domain (!from:domain) */
+  notSenderDomain?: string;
+  /** Exclude emails from this sender email (!from:email) */
+  notSenderEmail?: string;
+  /** Exclude emails to this recipient (!to:address) */
+  notRecipient?: string;
+  /** Exclude emails whose subject contains this text (!subject:text) */
+  notSubject?: string;
   selectedSenders?: string[];
   dateFrom?: string;
   dateTo?: string;
@@ -31,10 +40,15 @@ export function filterEmails(emails: Email[], options: EmailFilterOptions): Emai
   const {
     searchQuery = '',
     otpOnly = false,
+    hasAttachment = false,
     senderDomain = '',
     senderEmail = '',
     recipient = '',
     subject = '',
+    notSenderDomain = '',
+    notSenderEmail = '',
+    notRecipient = '',
+    notSubject = '',
     selectedSenders = [],
     dateFrom = '',
     dateTo = '',
@@ -75,6 +89,12 @@ export function filterEmails(emails: Email[], options: EmailFilterOptions): Emai
     // OTP-only filter
     const matchesOtp = !otpOnly || email.isOtp || !!email.otp;
 
+    // Has-attachment filter (metadata only — some providers can't download)
+    const matchesAttachment =
+      !hasAttachment ||
+      (Array.isArray(email.attachments) && email.attachments.length > 0) ||
+      email.hasAttachment === true;
+
     // Sender domain filter
     const matchesDomain =
       !senderDomain || email.from?.toLowerCase().includes(senderDomain.toLowerCase());
@@ -89,6 +109,22 @@ export function filterEmails(emails: Email[], options: EmailFilterOptions): Emai
 
     // Subject filter
     const matchesSubject = !subject || email.subject?.toLowerCase().includes(subject.toLowerCase());
+
+    // Excluded sender domain (!from:domain)
+    const matchesNotDomain =
+      !notSenderDomain || !email.from?.toLowerCase().includes(notSenderDomain.toLowerCase());
+
+    // Excluded sender email (!from:email)
+    const matchesNotSenderEmail =
+      !notSenderEmail || email.from?.toLowerCase() !== notSenderEmail.toLowerCase();
+
+    // Excluded recipient (!to:address)
+    const matchesNotRecipient =
+      !notRecipient || !email.original_inbox?.toLowerCase().includes(notRecipient.toLowerCase());
+
+    // Excluded subject text (!subject:text)
+    const matchesNotSubject =
+      !notSubject || !email.subject?.toLowerCase().includes(notSubject.toLowerCase());
 
     // Selected senders filter (multi-select)
     const matchesSelectedSenders =
@@ -110,10 +146,15 @@ export function filterEmails(emails: Email[], options: EmailFilterOptions): Emai
     return (
       matchesSearch &&
       matchesOtp &&
+      matchesAttachment &&
       matchesDomain &&
       matchesSenderEmail &&
       matchesRecipient &&
       matchesSubject &&
+      matchesNotDomain &&
+      matchesNotSenderEmail &&
+      matchesNotRecipient &&
+      matchesNotSubject &&
       matchesSelectedSenders &&
       matchesDateRange
     );

@@ -2,20 +2,22 @@
  * FormScore — classify signup-form fields for the autofill intelligence layer.
  */
 
-import { normalizeDomain } from './storage.js';
+import { safeId, safeName, safePlaceholder } from '@/utils/dom-safe.js';
+import { normalizeDomain } from '@/utils/validation.js';
+import { classifyFieldA11y } from './a11y-fields.js';
 import type { FormFieldKind, FormScore, ScoredField } from './types.js';
 
 function fieldMeta(el: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement): string {
   const labelText = (() => {
     try {
-      if ('labels' in el && el.labels && el.labels.length > 0) {
+      if (el.labels?.length) {
         return Array.from(el.labels)
           .map((l) => l.textContent || '')
           .join(' ');
       }
-      const id = el.id;
-      if (id) {
-        const lab = el.ownerDocument?.querySelector(`label[for="${CSS.escape(id)}"]`);
+      const elId = safeId(el);
+      if (elId) {
+        const lab = el.ownerDocument?.querySelector(`label[for="${CSS.escape(elId)}"]`);
         if (lab?.textContent) return lab.textContent;
       }
     } catch {
@@ -23,15 +25,36 @@ function fieldMeta(el: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElemen
     }
     return '';
   })();
-  return `${el.name} ${el.id} ${'placeholder' in el ? el.placeholder : ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('autocomplete') || ''} ${labelText}`.toLowerCase();
+  return `${safeName(el)} ${safeId(el)} ${'placeholder' in el ? safePlaceholder(el) : ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('autocomplete') || ''} ${labelText}`.toLowerCase();
 }
 
-function scoreKind(el: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement): ScoredField {
+async function scoreKind(
+  el: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement
+): Promise<ScoredField> {
+  // A11y-first: prefer label/aria before raw name heuristics
+  const a11y = await classifyFieldA11y(el);
+  if (a11y.kind !== 'unknown' && a11y.confidence >= 0.75) {
+    return { kind: a11y.kind, confidence: a11y.confidence };
+  }
+
   const tag = el.tagName.toLowerCase();
   const type = (el as HTMLInputElement).type?.toLowerCase?.() || '';
   const meta = fieldMeta(el);
 
-  if (type === 'password' || /password|passwd|pwd|secret/.test(meta)) {
+  // Username before password so "username" never scores as password
+  if (
+    type !== 'password' &&
+    /user.?name|userid|user_id|handle|nickname|login.?name|account.?name/.test(meta)
+  ) {
+    return { kind: 'username', confidence: 0.88 };
+  }
+  if (
+    type === 'password' ||
+    ((/password|passwd|\bpwd\b|passcode|new-password|current-password/.test(meta) ||
+      el.getAttribute('autocomplete') === 'new-password' ||
+      el.getAttribute('autocomplete') === 'current-password') &&
+      !/user.?name|userid|handle/.test(meta))
+  ) {
     return { kind: 'password', confidence: type === 'password' ? 0.98 : 0.85 };
   }
   if (
@@ -46,9 +69,6 @@ function scoreKind(el: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElemen
   }
   if (type === 'url' || /\bwebsite\b|\burl\b|homepage/.test(meta)) {
     return { kind: 'website', confidence: 0.85 };
-  }
-  if (/user.?name|userid|login.?id|\buid\b/.test(meta)) {
-    return { kind: 'username', confidence: 0.82 };
   }
   if (/first.?name|fname|given.?name/.test(meta)) {
     return { kind: 'firstName', confidence: 0.9 };
@@ -95,7 +115,7 @@ function scoreKind(el: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElemen
 /**
  * Score a form for signup autofill readiness.
  */
-export function scoreForm(form: HTMLFormElement, pageDomain?: string): FormScore {
+export async function scoreForm(form: HTMLElement, pageDomain?: string): Promise<FormScore> {
   const domain =
     normalizeDomain(pageDomain || (typeof location !== 'undefined' ? location.hostname : '')) ||
     'unknown';
@@ -105,7 +125,7 @@ export function scoreForm(form: HTMLFormElement, pageDomain?: string): FormScore
   const fields: ScoredField[] = [];
   for (const el of inputs) {
     if ((el as HTMLInputElement).disabled) continue;
-    const scored = scoreKind(el);
+    const scored = await scoreKind(el);
     if (scored.kind !== 'unknown' || scored.confidence >= 0.5) {
       fields.push(scored);
     }
@@ -117,21 +137,27 @@ export function scoreForm(form: HTMLFormElement, pageDomain?: string): FormScore
   const hasTerms = kinds.has('terms');
   const hasName = kinds.has('firstName') || kinds.has('lastName') || kinds.has('fullName');
   const hasUsername = kinds.has('username');
+  const hasPhone = kinds.has('phone');
 
-  // Heuristic signup likelihood
+  // Heuristic signup likelihood (works for progressive SPA steps too)
   let signup = 0.15;
   if (hasEmail) signup += 0.28;
   if (hasPassword) signup += 0.28;
   if (hasName) signup += 0.12;
   if (hasUsername) signup += 0.08;
+  if (hasPhone) signup += 0.08;
   if (hasTerms) signup += 0.1;
+  if (fields.length >= 2) signup += 0.06;
   if (fields.length >= 4) signup += 0.08;
   if (fields.length >= 6) signup += 0.05;
+  // Progressive single-step: email/phone + continue (no password yet)
+  if (hasEmail && !hasPassword && fields.length <= 3) signup += 0.12;
   // Form text hints
   try {
-    const text = `${form.id} ${form.className} ${form.getAttribute('action') || ''}`.toLowerCase();
-    if (/sign.?up|register|create.?account|join/.test(text)) signup += 0.12;
-    if (/login|sign.?in|auth/.test(text) && !hasPassword) signup -= 0.1;
+    const text =
+      `${safeId(form)} ${form.className} ${(form as HTMLFormElement).action || form.getAttribute('action') || ''} ${form.getAttribute('aria-label') || ''}`.toLowerCase();
+    if (/sign.?up|register|create.?account|join|welcome/.test(text)) signup += 0.12;
+    if (/login|sign.?in|auth/.test(text) && !hasPassword && !hasEmail) signup -= 0.1;
   } catch {
     /* ignore */
   }

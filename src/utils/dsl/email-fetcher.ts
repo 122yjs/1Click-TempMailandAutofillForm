@@ -469,7 +469,83 @@ function mapMessageItem(
     }
   }
 
+  // Capture the provider's "has attachments" flag (e.g. Guerrilla `att: "1"`)
+  // so badges and the has:attachment filter work even when the manifest is
+  // missing from this particular response.
+  const flagPath = attachmentMapping?.hasAttachmentFlagPath;
+  if (flagPath && isAttachmentFlagTruthy(extractPath(item, flagPath))) {
+    mapped.hasAttachment = true;
+  }
+
   return mapped;
+}
+
+/**
+ * A provider attachment flag (e.g. Guerrilla `att: "1"`) counts as attached
+ * when present and not "0"/"false".
+ */
+function isAttachmentFlagTruthy(flag: unknown): boolean {
+  const flagStr = flag === null || flag === undefined ? '' : String(flag).toLowerCase();
+  return flagStr !== '' && flagStr !== '0' && flagStr !== 'false';
+}
+
+// ============================================================================
+// RAW SOURCE MIME UTILITIES (generic — not provider-specific)
+// ============================================================================
+
+/** Decode quoted-printable content (RFC 2045 §6.7). */
+function decodeQuotedPrintable(input: string): string {
+  return input
+    .replace(/=\r?\n/g, '') // soft line breaks
+    .replace(/=([0-9A-Fa-f]{2})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)));
+}
+
+/** Decode base64 content, tolerating line breaks. */
+function decodeBase64(input: string): string {
+  try {
+    return atob(input.replace(/\s+/g, ''));
+  } catch {
+    return input;
+  }
+}
+
+/**
+ * Extract the first `text/html` part from a raw MIME message (multipart or
+ * single-part). Returns the decoded HTML, or null when none exists — callers
+ * fall back to the provider's filtered `body_html`.
+ */
+function extractHtmlPartFromRawSource(rawSource: string): string | null {
+  if (!rawSource || typeof rawSource !== 'string') return null;
+
+  const boundaryMatch = rawSource.match(/boundary="([^"]+)"/);
+  // Single-part message: strip any leading MIME headers and return the rest
+  // when it looks like HTML.
+  if (!boundaryMatch) {
+    const body = rawSource.replace(/^[\s\S]*?\r?\n\r?\n/, '').trim();
+    return body && /<[a-zA-Z][^>]*>/i.test(body) ? body : null;
+  }
+
+  const boundary = boundaryMatch[1];
+  const parts = rawSource.split(`--${boundary}`);
+  for (const part of parts) {
+    const headerEnd = part.search(/\r?\n\r?\n/);
+    if (headerEnd === -1) continue;
+    const headers = part.slice(0, headerEnd);
+    if (!/content-type:\s*text\/html/i.test(headers)) continue;
+
+    let body = part.slice(headerEnd + (part.startsWith('\r\n', headerEnd) ? 2 : 1));
+    // Strip the trailing closing boundary marker if present.
+    body = body.replace(/\r?\n?--\s*$/, '');
+
+    const encoding = (headers.match(/content-transfer-encoding:\s*(\S+)/i) || [])[1] || '';
+    if (encoding.toLowerCase() === 'quoted-printable') {
+      body = decodeQuotedPrintable(body);
+    } else if (encoding.toLowerCase() === 'base64') {
+      body = decodeBase64(body);
+    }
+    return body.trim();
+  }
+  return null;
 }
 
 // ============================================================================
@@ -479,6 +555,7 @@ function mapMessageItem(
 export {
   buildRequest,
   checkForErrors,
+  extractHtmlPartFromRawSource,
   extractPath,
   mapMessageItem,
   parseDateString,
@@ -752,6 +829,18 @@ async function fetchEmailsMultiStep(
     log('multi_step email fetching requires a listItemIdField');
     return [];
   }
+  // Capture list-level attachment flags (e.g. `att: "1"`) so hasAttachment is
+  // known from the list response itself — the badge lights up the moment mail
+  // arrives, independent of the detail fetch.
+  const listAttFlagPath = emailFetchingConfig.attachmentMapping?.hasAttachmentFlagPath;
+  const listAttFlags = new Map<string, boolean>();
+  if (listAttFlagPath) {
+    for (const msg of messages) {
+      if (isAttachmentFlagTruthy(extractPath(msg, listAttFlagPath))) {
+        listAttFlags.set(String(msg[listItemIdField]), true);
+      }
+    }
+  }
   const existingEmailIds = new Set(storedEmails[inbox.address].map((email: Email) => email.id));
   const newMessages = messages.filter(
     (msg: Record<string, unknown>) => !existingEmailIds.has(String(msg[listItemIdField]))
@@ -793,6 +882,37 @@ async function fetchEmailsMultiStep(
         emailFetchingConfig.attachmentMapping
       );
 
+      // Fetch the untouched raw MIME source when the provider configures a
+      // rawSource block. Generic and config-driven — the operation name, id
+      // param, and response path all come from providers.jsonc. Best-effort:
+      // a raw-source failure never fails the message fetch (we fall back to
+      // the provider's `body_html` below).
+      let rawSource: string | undefined;
+      const rawSourceConfig = emailFetchingConfig.rawSource;
+      if (rawSourceConfig) {
+        try {
+          const rawContext: EmailServiceContext = token
+            ? {
+                auth: { token: token as string },
+                variables: { [rawSourceConfig.itemIdParam]: String(msg[listItemIdField]) },
+              }
+            : {
+                variables: { [rawSourceConfig.itemIdParam]: String(msg[listItemIdField]) },
+              };
+          const rawSourceData = await executeOperation(rawSourceConfig.operation, rawContext);
+          const rawValue = extractPath(rawSourceData, rawSourceConfig.sourcePath);
+          if (typeof rawValue === 'string' && rawValue.trim().length > 0) {
+            rawSource = rawValue;
+          }
+        } catch (rawError: unknown) {
+          log(
+            `Failed to fetch raw source for message ${String(msg[listItemIdField])}: ${String(
+              rawError
+            )}`
+          );
+        }
+      }
+
       // Parse timestamp
       const timestamp = parseTimestamp(
         mapped.timestamp_field,
@@ -801,10 +921,15 @@ async function fetchEmailsMultiStep(
         listData
       );
 
+      // Prefer the untouched HTML from the raw source over the provider's
+      // filtered `body_html` when the raw source actually carries an HTML
+      // part — this restores original styling/structure that servers strip.
+      const rawHtml = rawSource ? extractHtmlPartFromRawSource(rawSource) : null;
+      const bodyHtml = String((rawHtml ?? mapped.body_html) || '');
+      const bodyPlain = String(mapped.body_plain || '');
+
       // Extract OTP + magic links
       const subject = String(mapped.subject || '');
-      const bodyHtml = String(mapped.body_html || '');
-      const bodyPlain = String(mapped.body_plain || '');
       const otp = extractOTP(subject, bodyHtml || bodyPlain);
       const magicLinks = extractMagicLinks(subject, bodyHtml, bodyPlain);
 
@@ -826,12 +951,19 @@ async function fetchEmailsMultiStep(
         subject,
         body_html: bodyHtml,
         body_plain: bodyPlain,
+        raw_source: rawSource,
         received_at: timestamp || Math.floor(Date.now() / 1000),
         otp: otp || undefined,
         magicLinks: magicLinks.length > 0 ? magicLinks : undefined,
         hasMagicLink: magicLinks.length > 0,
         stored_at: Date.now(),
         attachments: mapped.attachments as Email['attachments'],
+        // List-flag OR detail-flag OR manifest — the stored email is
+        // self-describing even if only one source carried the info.
+        hasAttachment:
+          mapped.hasAttachment === true ||
+          listAttFlags.get(String(msg[listItemIdField])) === true ||
+          (Array.isArray(mapped.attachments) && mapped.attachments.length > 0),
       };
     })
   );

@@ -4,6 +4,7 @@ import {
   GOOGLE_FAVICON_API_URL,
   MAX_FAVICON_CACHE_SIZE,
 } from '@/utils/constants.js';
+import { isPublicHostname } from '@/utils/instance-validation.js';
 import { logDebug, logError } from '@/utils/logger.js';
 import { beforeStorageWrite } from '@/utils/storageMonitor.js';
 
@@ -32,68 +33,52 @@ export interface FaviconErrorEntry {
 
 // ── Domain Parsing ──────────────────────────────────────────────────────────
 
+/** Lightweight root-domain extraction (replaces tldts to keep bundles small). */
+const MLEVEL_TLDS = new Set([
+  'co.uk',
+  'co.jp',
+  'co.in',
+  'co.il',
+  'co.za',
+  'co.kr',
+  'co.nz',
+  'co.id',
+  'com.br',
+  'com.mx',
+  'com.au',
+  'com.ar',
+  'com.sg',
+  'com.my',
+  'com.ph',
+  'net.au',
+  'net.br',
+  'org.uk',
+  'org.au',
+  'org.br',
+  'gov.uk',
+  'gov.au',
+  'ac.uk',
+  'ac.jp',
+  'sch.uk',
+  'k12.ca.us',
+]);
+
 /** Extract domain from an email address */
 export function getDomainFromEmail(email: string): string {
   const match = email.match(/@([^@]+)$/);
   return match ? match[1] : '';
 }
 
-/** Get root domain, handling multi-level TLDs like .co.uk */
+/** Get root domain, handling common multi-level TLDs like .co.uk */
 export function getRootDomain(domain: string): string {
-  const parts = domain.split('.');
-  const multiLevelTLDs = [
-    'co.uk',
-    'com.au',
-    'co.nz',
-    'co.za',
-    'ac.uk',
-    'gov.uk',
-    'org.uk',
-    'net.uk',
-    'nhs.uk',
-    'police.uk',
-    'mod.uk',
-    'sch.uk',
-    'com.br',
-    'co.jp',
-    'com.cn',
-    'co.in',
-    'com.in',
-    'com.sg',
-    'com.hk',
-    'com.tw',
-    'com.mx',
-    'com.tr',
-    'com.pe',
-    'com.pk',
-  ];
-  const tld = parts.slice(-2).join('.');
-
-  if (multiLevelTLDs.includes(tld)) {
-    if (parts.length > 3) return parts.slice(-3).join('.');
-    if (parts.length === 3) {
-      const firstPart = parts[0];
-      const commonSubdomains = [
-        'www',
-        'mail',
-        'email',
-        'web',
-        'm',
-        'mobile',
-        'app',
-        'api',
-        'blog',
-        'shop',
-        'store',
-      ];
-      if (commonSubdomains.includes(firstPart)) {
-        return parts.slice(-2).join('.');
-      }
-      return domain;
-    }
+  if (!domain) return '';
+  const parts = domain.toLowerCase().split('.').filter(Boolean);
+  if (parts.length >= 3) {
+    const tld2 = `${parts[parts.length - 2]}.${parts[parts.length - 1]}`;
+    if (MLEVEL_TLDS.has(tld2)) return parts.slice(-3).join('.');
   }
-
-  return parts.length > 2 ? parts.slice(-2).join('.') : domain;
+  if (parts.length >= 2) return parts.slice(-2).join('.');
+  return domain;
 }
 
 /** Strip dash and preceding word from domain (email-staples.co.uk → staples.co.uk) */
@@ -108,25 +93,71 @@ export function getStrippedDomain(domain: string): string {
 /** Direct /favicon.ico URL from an email sender */
 export function getDomainFaviconUrl(sender: string): string {
   const domain = sender.split('@')[1] || sender;
-  return `https://${domain}/favicon.ico`;
+  const cleanDomain = domain.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+  return `https://${cleanDomain}/favicon.ico`;
 }
 
 /** Root-domain /favicon.ico URL from an email sender */
 export function getRootDomainFaviconUrl(sender: string): string {
   const domain = sender.split('@')[1] || sender;
   const root = getRootDomain(domain);
-  return `https://${root}/favicon.ico`;
+  const cleanRoot = root.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+  return `https://${cleanRoot}/favicon.ico`;
 }
 
 /** Generic favicon.ico URL for a domain */
 export function getFaviconUrl(domain: string): string {
   if (!domain) return '';
-  return `https://${domain}/favicon.ico`;
+  // Strip any protocol prefix that may already be present
+  const cleanDomain = domain.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+  return `https://${cleanDomain}/favicon.ico`;
 }
 
 /** Google favicon API URL */
 export function getGoogleFaviconUrl(domain: string, size: number = 32): string {
   return `${GOOGLE_FAVICON_API_URL}?sz=${size}&domain=${domain}`;
+}
+
+// ── SSRF-safe favicon URL builders ───────────────────────────────────────────
+//
+// `getDomainFaviconUrl` / `getRootDomainFaviconUrl` build a direct
+// `https://<sender-domain>/favicon.ico` URL from an attacker-controllable
+// email `from` field. When rendered as a raw `<img src>` (bypassing the
+// background `fetchFavicon` handler, which IS SSRF-gated), a sender like
+// `x@internal-host.local` forces the extension UI to issue an image request
+// to an internal host. These safe variants validate the resolved host with
+// `isPublicHostname` (same guard used for custom provider instances) and fall
+// back to the Google favicon proxy for any private/loopback/link-local host,
+// so the extension never probes internal networks from untrusted mail.
+
+function cleanHost(raw: string): string {
+  return raw.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+}
+
+/**
+ * Safe per-sender favicon URL: direct `/favicon.ico` for public hosts,
+ * Google favicon proxy for private/loopback/link-local hosts.
+ */
+export function getSafeDomainFaviconUrl(sender: string): string {
+  const domain = sender.split('@')[1] || sender;
+  const host = cleanHost(domain);
+  if (!host) return getGoogleFaviconUrl(host);
+  return isPublicHostname(host.replace(/:\d+$/, '')) // strip port for host check
+    ? `https://${host}/favicon.ico`
+    : getGoogleFaviconUrl(host);
+}
+
+/**
+ * Safe root-domain favicon URL: direct `/favicon.ico` for public root
+ * domains, Google favicon proxy for private/loopback/link-local hosts.
+ */
+export function getSafeRootDomainFaviconUrl(sender: string): string {
+  const domain = sender.split('@')[1] || sender;
+  const root = cleanHost(getRootDomain(domain));
+  if (!root) return getGoogleFaviconUrl(root);
+  return isPublicHostname(root.replace(/:\d+$/, ''))
+    ? `https://${root}/favicon.ico`
+    : getGoogleFaviconUrl(root);
 }
 
 // ── Background Fetch ────────────────────────────────────────────────────────
@@ -354,6 +385,7 @@ export async function getFaviconCacheStats(): Promise<{ count: number; sizeBytes
     const str = JSON.stringify(cache);
     return { count: Object.keys(cache).length, sizeBytes: str.length };
   } catch {
+    /* ignore */
     return { count: 0, sizeBytes: 0 };
   }
 }

@@ -99,6 +99,7 @@ export function tryLoadProviderConfig(providerId: string): ProviderConfig | null
   try {
     return loadProviderConfig(providerId);
   } catch {
+    /* ignore */
     return providerId === 'demo' ? DEMO_PROVIDER_CONFIG : null;
   }
 }
@@ -241,6 +242,21 @@ export interface ProviderConfig {
     detailResponseMapping?: Record<string, string | { path: string; transform: string | string[] }>;
     selectMailboxOperation?: string;
     selectMailboxVariable?: string;
+    /** When set, the fetcher additionally retrieves the raw MIME source per
+     * message via a dedicated operation and stores it on `Email.raw_source`.
+     * Providers frequently serve a server-filtered `mail_body` (e.g. stripped
+     * <style>/@media and rewritten image URLs) — the raw source preserves the
+     * original so rendering and .eml export stay pixel-faithful.
+     *
+     * Fully config-driven: the DSL never references a specific provider. */
+    rawSource?: {
+      /** Operation name (from `operations`) that returns the raw source. */
+      operation: string;
+      /** Context variable name carrying the message id (e.g. "email_id"). */
+      itemIdParam: string;
+      /** Response path to the raw source string (e.g. "source"). */
+      sourcePath: string;
+    };
     sequenceTracking?: {
       enabled: boolean;
       sequenceField: string;
@@ -250,6 +266,10 @@ export interface ProviderConfig {
     attachmentMapping?: {
       enabled: boolean;
       path: string;
+      /** Optional field on the raw message whose truthy value (e.g. "1")
+       * flags the message as having attachments — mapped to `Email.hasAttachment`
+       * so badges/filters work even before/without the attachment manifest. */
+      hasAttachmentFlagPath?: string;
       fields: {
         filename: string;
         mimeType: string;
@@ -265,6 +285,8 @@ export interface ProviderConfig {
   };
   expiry?: {
     duration: number;
+    /** Per-message server retention (ms) — independent of the mailbox session (Model 2). */
+    messageRetentionDuration?: number;
     renewable: boolean;
     renewalMethod?: string | null;
     strategy?: 'relative' | 'absolute' | 'ttl';
@@ -272,6 +294,17 @@ export interface ProviderConfig {
       createdAt?: string;
       expiresAt?: string;
       ttl?: string;
+    };
+    /** Adaptive auto-renew timing config. */
+    renewal?: {
+      /** How many API calls a renewal takes (some providers need 2). */
+      apiCallCount?: number;
+      /** How many API calls creation takes (default 1). */
+      createApiCallCount?: number;
+      /** Minimum pre-expiry window to start auto-renew (ms). */
+      minPreExpiryWindowMs?: number;
+      /** Extra buffer over measured latency as a fraction (0.25 = 25%). */
+      safetyBufferRatio?: number;
     };
   };
   customEmail?: {
@@ -433,12 +466,14 @@ export class EmailService {
     const setCookie = headers.get('set-cookie') || headers.get('Set-Cookie');
     if (!setCookie) return;
 
-    const cookies = setCookie.split(',');
-    for (const cookieStr of cookies) {
-      const parts = cookieStr.split(';')[0].split('=');
-      if (parts.length === 2) {
-        const name = parts[0].trim();
-        const value = parts[1].trim();
+    // Use regex to split cookies safely without breaking on commas inside HTTP date formats (e.g. Expires=Wed, 21 Oct ...)
+    const cookieList = setCookie.split(/,\s*(?=[a-zA-Z0-9_.-]+=)/);
+    for (const cookieStr of cookieList) {
+      const mainPair = cookieStr.split(';')[0];
+      const eqIdx = mainPair.indexOf('=');
+      if (eqIdx > 0) {
+        const name = mainPair.slice(0, eqIdx).trim();
+        const value = mainPair.slice(eqIdx + 1).trim();
         if (this.config.cookies.capture.includes(name)) {
           this.sessionCookies[name] = value;
         }
@@ -519,6 +554,7 @@ export class EmailService {
         const parsed = JSON.parse(text);
         return { result: !!parsed };
       } catch {
+        /* ignore */
         return { result: false };
       }
     }

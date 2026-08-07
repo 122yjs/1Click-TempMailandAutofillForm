@@ -5,6 +5,7 @@
 import { browser } from 'wxt/browser';
 import { addActivityEvent } from '@/utils/activity-tracker.js';
 import { DEBUG, MAX_ARCHIVED_EMAILS, MAX_STORED_EMAILS_PER_INBOX } from '@/utils/constants.js';
+import { tSync } from '@/utils/i18n-utils.js';
 import { log, logError } from '@/utils/logger.js';
 import { withLock } from '@/utils/mutex.js';
 import {
@@ -14,7 +15,8 @@ import {
   getStoredEmailsMap,
 } from '@/utils/storage-keys.js';
 import { safeStorageSet } from '@/utils/storageMonitor.js';
-import { timeAgo } from '@/utils/time.js';
+import { toMs } from '@/utils/time.js';
+import { timeAgo } from '@/utils/time-format.js';
 import type { Account, Email, EmailFilters, NotificationSettings } from '@/utils/types.js';
 
 /**
@@ -24,15 +26,19 @@ function playNotificationSound() {
   try {
     // We only initialize audio context if we are in a DOM environment (popup/sidepanel).
     // Service workers do not have access to window or AudioContext.
-    const audioContext =
-      typeof window !== 'undefined'
-        ? new (
-            window.AudioContext ||
-            (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
-          )()
-        : null;
+    if (
+      typeof AudioContext === 'undefined' &&
+      typeof (globalThis as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext ===
+        'undefined'
+    )
+      return;
+    const AudioContextClass =
+      typeof AudioContext !== 'undefined'
+        ? AudioContext
+        : (globalThis as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextClass) return;
 
-    if (!audioContext) return;
+    const audioContext = new AudioContextClass();
 
     const oscillator = audioContext.createOscillator();
     const gainNode = audioContext.createGain();
@@ -64,9 +70,6 @@ function playNotificationSound() {
   }
 }
 
-const _ACTIVE_EMAIL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-const _ARCHIVED_EMAIL_RETENTION_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
-
 // Check if storage quota is exceeded
 async function isQuotaExceeded(error: unknown): Promise<boolean> {
   if (error instanceof DOMException) {
@@ -81,7 +84,6 @@ async function isQuotaExceeded(error: unknown): Promise<boolean> {
 /** Resolve bag for an address with case-insensitive key match. */
 function bagForAddress(storedEmails: Record<string, Email[]>, inboxAddress: string): Email[] {
   if (!inboxAddress) return [];
-  if (storedEmails[inboxAddress]?.length) return storedEmails[inboxAddress] || [];
   if (storedEmails[inboxAddress]) return storedEmails[inboxAddress] || [];
   const lower = inboxAddress.toLowerCase();
   for (const [k, list] of Object.entries(storedEmails)) {
@@ -90,58 +92,38 @@ function bagForAddress(storedEmails: Record<string, Email[]>, inboxAddress: stri
   return [];
 }
 
-export async function getStoredEmails(inboxAddress: string): Promise<Email[]> {
+export async function getStoredEmails(inboxAddress: string, _isRetry = false): Promise<Email[]> {
   try {
     const storedEmails = await getStoredEmailsMap();
     return bagForAddress(storedEmails, inboxAddress);
   } catch (error: unknown) {
     if (await isQuotaExceeded(error)) {
+      if (_isRetry) {
+        logError('Storage quota still exceeded after cleanup', { inboxAddress });
+        throw new Error('Storage quota exceeded. Please free up space.');
+      }
       logError('Storage quota exceeded, attempting to clean up old emails', { inboxAddress });
-      // Try to clean up old emails based on retention settings
       const emailRetentionDays = await getEmailRetentionDays();
       await cleanupOldStoredEmails(emailRetentionDays, emailRetentionDays * 3);
-      // Retry getting stored emails
-      try {
-        const storedEmails = await getStoredEmailsMap();
-        return bagForAddress(storedEmails, inboxAddress);
-      } catch (retryError: unknown) {
-        if (await isQuotaExceeded(retryError)) {
-          logError('Storage quota still exceeded after cleanup', { inboxAddress });
-          return [];
-        } else {
-          throw retryError;
-        }
-      }
-    } else {
-      throw error;
+      return getStoredEmails(inboxAddress, true);
     }
+    throw error;
   }
 }
 
 function enforceMaxArchivedEmailsLimit(archivedEmails: Record<string, Email[]>): void {
-  const allArchived: Array<{ address: string; email: Email }> = [];
-  for (const [address, emails] of Object.entries(archivedEmails)) {
-    for (const email of emails) {
-      allArchived.push({ address, email });
-    }
-  }
+  const allArchived = Object.values(archivedEmails).flat();
   if (allArchived.length > MAX_ARCHIVED_EMAILS) {
     allArchived.sort((a, b) => {
-      const tA = a.email.archived_at || a.email.received_at * 1000;
-      const tB = b.email.archived_at || b.email.received_at * 1000;
+      const tA = (a as Email & { archived_at?: number }).archived_at || toMs(a.received_at);
+      const tB = (b as Email & { archived_at?: number }).archived_at || toMs(b.received_at);
       return tB - tA;
     });
-    const kept = allArchived.slice(0, MAX_ARCHIVED_EMAILS);
-    const newArchivedEmails: Record<string, Email[]> = {};
-    for (const item of kept) {
-      if (!newArchivedEmails[item.address]) {
-        newArchivedEmails[item.address] = [];
-      }
-      newArchivedEmails[item.address].push(item.email);
-    }
+    const keptIds = new Set(allArchived.slice(0, MAX_ARCHIVED_EMAILS).map((e) => e.id));
     for (const address of Object.keys(archivedEmails)) {
-      if (newArchivedEmails[address]) {
-        archivedEmails[address] = newArchivedEmails[address];
+      const kept = archivedEmails[address].filter((e) => keptIds.has(e.id));
+      if (kept.length > 0) {
+        archivedEmails[address] = kept;
       } else {
         delete archivedEmails[address];
       }
@@ -151,21 +133,26 @@ function enforceMaxArchivedEmailsLimit(archivedEmails: Record<string, Email[]>):
 
 export async function clearStoredEmails(inboxAddress: string): Promise<void> {
   async function doArchive(): Promise<void> {
-    const { storedEmails, archivedEmails } = await getEmailMaps();
-    if (storedEmails[inboxAddress] && storedEmails[inboxAddress].length > 0) {
-      if (!archivedEmails[inboxAddress]) archivedEmails[inboxAddress] = [];
-      const emailsToArchive = storedEmails[inboxAddress].map((email: Email) => ({
-        ...email,
-        archived: true,
-        archived_at: Date.now(),
-        original_inbox: inboxAddress,
-      }));
-      archivedEmails[inboxAddress].push(...emailsToArchive);
+    await withLock('emails_storage_lock', async () => {
+      const { storedEmails, archivedEmails } = await getEmailMaps();
+      let archivedCount = 0;
+      if (storedEmails[inboxAddress] && storedEmails[inboxAddress].length > 0) {
+        if (!archivedEmails[inboxAddress]) archivedEmails[inboxAddress] = [];
+        const emailsToArchive = storedEmails[inboxAddress].map((email: Email) => ({
+          ...email,
+          archived: true,
+          archived_at: Date.now(),
+          original_inbox: inboxAddress,
+        }));
+        archivedEmails[inboxAddress].push(...emailsToArchive);
+        archivedCount = emailsToArchive.length;
+        delete storedEmails[inboxAddress];
+      }
       enforceMaxArchivedEmailsLimit(archivedEmails);
-      delete storedEmails[inboxAddress];
       await browser.storage.local.set({ storedEmails, archivedEmails });
-      log(`Archived ${emailsToArchive.length} emails for expired inbox: ${inboxAddress}`);
-    }
+      if (archivedCount > 0)
+        log(`Archived ${archivedCount} emails for expired inbox: ${inboxAddress}`);
+    });
   }
 
   try {
@@ -182,11 +169,54 @@ export async function clearStoredEmails(inboxAddress: string): Promise<void> {
   }
 }
 
+/**
+ * Move emails from archivedEmails back into storedEmails when an inbox is
+ * unarchived / restored / renewed, so Offline Saved history remains available.
+ */
+export async function restoreArchivedEmailsToStored(inboxAddress: string): Promise<void> {
+  await withLock('emails_storage_lock', async () => {
+    const { storedEmails, archivedEmails } = await getEmailMaps();
+    const archived = archivedEmails[inboxAddress] || [];
+    if (archived.length === 0) return;
+
+    const existing = storedEmails[inboxAddress] || [];
+    const seen = new Set(existing.map((e) => e.id));
+    const merged = [...existing];
+    for (const email of archived) {
+      if (seen.has(email.id)) continue;
+      seen.add(email.id);
+      const {
+        archived: _a,
+        archived_at: _at,
+        ...rest
+      } = email as Email & {
+        archived?: boolean;
+        archived_at?: number;
+      };
+      merged.push({
+        ...rest,
+        local_only: true,
+        local_only_since:
+          rest.local_only_since || rest.local_deleted_at || rest.stored_at || Date.now(),
+        original_inbox: rest.original_inbox || inboxAddress,
+      });
+    }
+    storedEmails[inboxAddress] = merged;
+    delete archivedEmails[inboxAddress];
+    await browser.storage.local.set({ storedEmails, archivedEmails });
+    log(`Restored ${archived.length} archived emails for inbox: ${inboxAddress}`);
+  });
+}
+
 export async function getArchivedEmails(inboxAddress?: string): Promise<Email[]> {
   const { archivedEmails } = await getEmailMaps();
 
   if (inboxAddress) {
-    return archivedEmails[inboxAddress] || [];
+    return (archivedEmails[inboxAddress] || []).sort(
+      (a: Email, b: Email) =>
+        ((b as Email & { archived_at?: number }).archived_at || toMs(b.received_at) || 0) -
+        ((a as Email & { archived_at?: number }).archived_at || toMs(a.received_at) || 0)
+    );
   }
 
   const allArchived: Email[] = [];
@@ -203,70 +233,87 @@ export async function getArchivedEmails(inboxAddress?: string): Promise<Email[]>
 
 export async function cleanupOldStoredEmails(
   activeRetentionDays: number = 30,
-  archivedRetentionDays: number = 90
+  archivedRetentionDays: number = 90,
+  skipLock: boolean = false
 ): Promise<void> {
   // If retention is 0, never delete
   if (activeRetentionDays === 0 && archivedRetentionDays === 0) {
     return;
   }
 
-  const { storedEmails, archivedEmails } = await getEmailMaps();
+  const task = async () => {
+    const { storedEmails, archivedEmails } = await getEmailMaps();
 
-  const activeThreshold =
-    activeRetentionDays === 0 ? 0 : Date.now() - activeRetentionDays * 24 * 60 * 60 * 1000;
-  const archivedThreshold =
-    archivedRetentionDays === 0 ? 0 : Date.now() - archivedRetentionDays * 24 * 60 * 60 * 1000;
-  let totalCleaned = 0;
+    const activeThreshold =
+      activeRetentionDays === 0 ? 0 : Date.now() - activeRetentionDays * 24 * 60 * 60 * 1000;
+    const archivedThreshold =
+      archivedRetentionDays === 0 ? 0 : Date.now() - archivedRetentionDays * 24 * 60 * 60 * 1000;
+    let totalCleaned = 0;
 
-  for (const [address, emails] of Object.entries(storedEmails)) {
-    const filteredEmails = emails.filter((email: Email & { stored_at?: number }) => {
-      const emailAge = email.stored_at || email.received_at * 1000;
-      return emailAge > activeThreshold;
-    });
+    for (const [address, emails] of Object.entries(storedEmails)) {
+      const filteredEmails = emails.filter((email: Email & { stored_at?: number }) => {
+        const emailAge = email.stored_at || toMs(email.received_at);
+        return emailAge > activeThreshold;
+      });
 
-    if (filteredEmails.length !== emails.length) {
-      storedEmails[address] = filteredEmails;
-      totalCleaned += emails.length - filteredEmails.length;
-    }
-  }
-
-  for (const [address, emails] of Object.entries(archivedEmails)) {
-    const filteredEmails = emails.filter(
-      (email: Email & { archived_at?: number; stored_at?: number }) => {
-        const emailAge = email.archived_at || email.stored_at || email.received_at * 1000;
-        return emailAge > archivedThreshold;
+      if (filteredEmails.length !== emails.length) {
+        storedEmails[address] = filteredEmails;
+        totalCleaned += emails.length - filteredEmails.length;
       }
-    );
-
-    if (filteredEmails.length !== emails.length) {
-      archivedEmails[address] = filteredEmails;
-      totalCleaned += emails.length - filteredEmails.length;
     }
-  }
 
-  const originalCount = Object.values(archivedEmails).flat().length;
-  enforceMaxArchivedEmailsLimit(archivedEmails);
-  const newCount = Object.values(archivedEmails).flat().length;
-  if (originalCount !== newCount) {
-    totalCleaned += originalCount - newCount;
-  }
+    for (const [address, emails] of Object.entries(archivedEmails)) {
+      const filteredEmails = emails.filter(
+        (email: Email & { archived_at?: number; stored_at?: number }) => {
+          const emailAge =
+            (email as Email & { archived_at?: number }).archived_at || toMs(email.received_at);
+          return emailAge > archivedThreshold;
+        }
+      );
 
-  if (totalCleaned > 0) {
-    await safeStorageSet(browser, { storedEmails, archivedEmails });
-    log(`Cleaned up ${totalCleaned} old/excess emails`);
+      if (filteredEmails.length !== emails.length) {
+        archivedEmails[address] = filteredEmails;
+        totalCleaned += emails.length - filteredEmails.length;
+      }
+    }
+
+    const originalCount = Object.values(archivedEmails).flat().length;
+    enforceMaxArchivedEmailsLimit(archivedEmails);
+    const newCount = Object.values(archivedEmails).flat().length;
+    if (originalCount !== newCount) {
+      totalCleaned += originalCount - newCount;
+    }
+
+    if (totalCleaned > 0) {
+      await safeStorageSet(browser, { storedEmails, archivedEmails });
+      log(`Cleaned up ${totalCleaned} old/excess emails`);
+    }
+  };
+
+  if (skipLock) {
+    await task();
+  } else {
+    await withLock('emails_storage_lock', task);
   }
 }
 
 export async function storeNewMessages(inboxAddress: string, newMessages: Email[]): Promise<void> {
   await withLock('emails_storage_lock', async () => {
-    const storedEmails = await getStoredEmailsMap();
+    const { storedEmails = {}, archivedEmails = {} } = await getEmailMaps();
     if (!storedEmails[inboxAddress]) {
       storedEmails[inboxAddress] = [];
     }
 
-    // Deduplicate messages by ID to avoid duplicates
-    const existingIds = new Set(storedEmails[inboxAddress].map((e: Email) => e.id));
-    const uniqueNewMessages = newMessages.filter((msg: Email) => !existingIds.has(msg.id));
+    // Deduplicate per-inbox only: same message ID may appear in different inboxes
+    // (e.g. same sender sends to multiple addresses). Checking across ALL inboxes
+    // would incorrectly suppress a message in inbox B just because it exists in inbox A.
+    const existingIds = new Set<string>();
+    const inboxStored = storedEmails[inboxAddress] || [];
+    const inboxArchived = (archivedEmails as Record<string, Email[]>)[inboxAddress] || [];
+    for (const e of inboxStored) if (e.id) existingIds.add(String(e.id));
+    for (const e of inboxArchived) if (e.id) existingIds.add(String(e.id));
+
+    const uniqueNewMessages = newMessages.filter((msg: Email) => !existingIds.has(String(msg.id)));
 
     if (uniqueNewMessages.length > 0) {
       for (const msg of uniqueNewMessages) {
@@ -282,8 +329,51 @@ export async function storeNewMessages(inboxAddress: string, newMessages: Email[
         );
       }
 
-      await safeStorageSet(browser, { storedEmails });
-      if (DEBUG) log(`Stored ${uniqueNewMessages.length} new emails for ${inboxAddress}`);
+      let success = await safeStorageSet(browser, { storedEmails });
+      if (!success) {
+        logError('Storage quota exceeded, attempting cleanup before retry', { inboxAddress });
+        const emailRetentionDays = await getEmailRetentionDays();
+        await cleanupOldStoredEmails(emailRetentionDays, emailRetentionDays * 3, true);
+
+        // Re-read stored emails after cleanup so we merge our new messages into the cleaned list
+        const refreshedMaps = await getEmailMaps();
+        const refreshedStored = refreshedMaps.storedEmails;
+        if (!refreshedStored[inboxAddress]) refreshedStored[inboxAddress] = [];
+        // Dedup against cleaned list again
+        const currentIds = new Set(refreshedStored[inboxAddress].map((e: Email) => e.id));
+        const refreshedUnique = newMessages.filter((msg: Email) => !currentIds.has(msg.id));
+        refreshedStored[inboxAddress].push(...refreshedUnique);
+        refreshedStored[inboxAddress].sort((a: Email, b: Email) => b.received_at - a.received_at);
+        if (refreshedStored[inboxAddress].length > MAX_STORED_EMAILS_PER_INBOX) {
+          refreshedStored[inboxAddress] = refreshedStored[inboxAddress].slice(
+            0,
+            MAX_STORED_EMAILS_PER_INBOX
+          );
+        }
+
+        success = await safeStorageSet(browser, { storedEmails: refreshedStored });
+        if (!success) {
+          // Last resort: aggressively trim the newest-message inbox (drop the
+          // OLDEST emails beyond a small floor) so newly-received mail is never
+          // silently dropped on quota exhaustion. Prefer dropping old mail over
+          // losing the brand-new message the user is waiting for.
+          logError('Storage quota exceeded after retention cleanup — trimming oldest emails', {
+            inboxAddress,
+          });
+          const floor = Math.min(MAX_STORED_EMAILS_PER_INBOX, 20);
+          let trimmedStored = refreshedStored[inboxAddress] || [];
+          if (trimmedStored.length > floor) {
+            trimmedStored = trimmedStored.slice(0, floor);
+            refreshedStored[inboxAddress] = trimmedStored;
+          }
+          success = await safeStorageSet(browser, { storedEmails: refreshedStored });
+          if (!success) {
+            logError('Failed to store new messages even after trimming', { inboxAddress });
+          }
+        }
+      }
+      if (DEBUG && success)
+        log(`Stored ${uniqueNewMessages.length} new emails for ${inboxAddress}`);
 
       // Process side effects for new messages
       await processNewMessages(inboxAddress, uniqueNewMessages);
@@ -335,7 +425,7 @@ export function filterMessages(messages: Email[], filters: EmailFilters = {}): E
       typeof filters.dateFrom === 'string'
         ? new Date(filters.dateFrom).getTime()
         : filters.dateFrom;
-    filteredMessages = filteredMessages.filter((msg: Email) => msg.received_at * 1000 >= fromTime);
+    filteredMessages = filteredMessages.filter((msg: Email) => toMs(msg.received_at) >= fromTime);
   }
 
   if (filters.dateTo) {
@@ -343,7 +433,7 @@ export function filterMessages(messages: Email[], filters: EmailFilters = {}): E
       typeof filters.dateTo === 'string'
         ? new Date(filters.dateTo).getTime() + 24 * 60 * 60 * 1000 - 1
         : filters.dateTo;
-    filteredMessages = filteredMessages.filter((msg: Email) => msg.received_at * 1000 <= toTime);
+    filteredMessages = filteredMessages.filter((msg: Email) => toMs(msg.received_at) <= toTime);
   }
 
   return filteredMessages;
@@ -379,20 +469,20 @@ async function processNewMessages(inboxAddress: string, uniqueNewMessages: Email
 
     if (latestNewMessageWithOtp?.otp) {
       try {
-        browser.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-          if (tabs.length > 0 && tabs[0].id) {
-            browser.tabs
-              .sendMessage(tabs[0].id, {
-                type: 'fillOTP',
-                otp: latestNewMessageWithOtp.otp,
-                sender: latestNewMessageWithOtp.from,
-                senderName: latestNewMessageWithOtp.from_name,
-                subject: latestNewMessageWithOtp.subject,
-              })
-              .catch(() => {});
-          }
-        });
-      } catch {}
+        // Broadcast OTP to ALL tabs (not just active) so wait-OTP panels on
+        // other tabs receive the code via cross-tab propagation.
+        void browser.runtime
+          .sendMessage({
+            type: 'fillOTP',
+            otp: latestNewMessageWithOtp.otp,
+            sender: latestNewMessageWithOtp.from,
+            senderName: latestNewMessageWithOtp.from_name,
+            subject: latestNewMessageWithOtp.subject,
+          })
+          .catch(() => {});
+      } catch {
+        /* ignore broadcast failure */
+      }
 
       // M5: Update latestOtp cache in storage
       const latestOtpRecord = {
@@ -401,11 +491,12 @@ async function processNewMessages(inboxAddress: string, uniqueNewMessages: Email
         senderName: latestNewMessageWithOtp.from_name || '',
         context: [
           latestNewMessageWithOtp.from_name ? `From: ${latestNewMessageWithOtp.from_name}` : '',
-          timeAgo(latestNewMessageWithOtp.received_at),
+          timeAgo(toMs(latestNewMessageWithOtp.received_at)),
         ]
           .filter(Boolean)
           .join(' | '),
         received_at: latestNewMessageWithOtp.received_at,
+        recipient: inboxAddress,
       };
       const currentLatestOtp = (
         (await browser.storage.local.get('latestOtp')) as {
@@ -451,14 +542,11 @@ async function processNewMessages(inboxAddress: string, uniqueNewMessages: Email
       await safeStorageSet(browser, { lastMessageTimestamps });
     }
 
-    // 4. Update email received analytics & OTP analytics
-    const analytics = await getAnalyticsRecord();
-    analytics.emailsReceived = (analytics.emailsReceived || 0) + uniqueNewMessages.length;
-
+    // 4. Tally analytics deltas; applied under analytics_lock at the end so a
+    //    concurrent recordEmailRead / incrementAnalytic can't be clobbered.
+    const emailsReceivedDelta = uniqueNewMessages.length;
     const newOtpCount = uniqueNewMessages.filter((msg: Email) => msg.otp).length;
-    if (newOtpCount > 0) {
-      analytics.otpsDetected = (analytics.otpsDetected || 0) + newOtpCount;
-    }
+    let notificationsSentDelta = 0;
 
     // 5. Send notifications for new messages
     const result = (await browser.storage.local.get(['notificationSettings'])) as {
@@ -480,6 +568,7 @@ async function processNewMessages(inboxAddress: string, uniqueNewMessages: Email
         const map = snoozeRes.notificationSnoozeByAddress || {};
         snoozedUntil = map[inbox.address] || map[inbox.address.toLowerCase()] || 0;
       } catch {
+        /* ignore */
         snoozedUntil = 0;
       }
       if (snoozedUntil > Date.now()) {
@@ -500,6 +589,7 @@ async function processNewMessages(inboxAddress: string, uniqueNewMessages: Email
             useDigest = decision.digest;
           }
         } catch {
+          /* ignore */
           toNotify = uniqueNewMessages;
         }
 
@@ -514,35 +604,57 @@ async function processNewMessages(inboxAddress: string, uniqueNewMessages: Email
             browser.notifications.create(notificationId, {
               type: 'basic',
               iconUrl: 'icons/icon48.png',
-              title: `${toNotify.length} new in ${inbox.address}`,
+              title: tSync('notifications.digestTitle', {
+                count: toNotify.length,
+                address: inbox.address,
+              }),
               message:
                 otpN > 0
-                  ? `${otpN} OTP · ${toNotify.length - otpN} other`
+                  ? tSync('notifications.digestMessageOtp', {
+                      otp: otpN,
+                      other: toNotify.length - otpN,
+                    })
                   : toNotify
                       .slice(0, 3)
-                      .map((m) => m.subject || m.from_name || 'Mail')
+                      .map((m) => m.subject || m.from_name || tSync('notifications.mail'))
                       .join(' · '),
               priority: 0,
-              contextMessage: 'Click to open mailbox',
+              contextMessage: tSync('notifications.clickToOpenMailbox'),
+              // Respect the soundEnabled toggle: mute the OS notification chime
+              // when the user disabled sounds (custom AudioContext sound doesn't
+              // run in the service worker anyway).
+              silent: !notificationSettings.soundEnabled,
             });
-            analytics.notificationsSent = (analytics.notificationsSent || 0) + 1;
+            notificationsSentDelta += 1;
             await addActivityEvent('notification_sent', {
               inboxAddress: inbox.address,
               message: `digest:${toNotify.length}`,
             });
           } else {
             toNotify.forEach((msg: Email) => {
-              const notificationId = `email:${msg.id}:${inbox.id}`;
+              const magicUrl =
+                msg.magicLinks?.[0]?.url || (msg as { magicLinkUrl?: string }).magicLinkUrl;
+              const notificationId = magicUrl
+                ? `magiclink:${msg.id}:${inbox.id}:${encodeURIComponent(magicUrl)}`
+                : `email:${msg.id}:${inbox.id}`;
               browser.notifications.create(notificationId, {
                 type: 'basic',
                 iconUrl: 'icons/icon48.png',
-                title: `New Email in ${inbox.address}`,
-                message: `${msg.from_name || 'Unknown Sender'}: ${msg.subject || 'No Subject'}`,
+                title: magicUrl
+                  ? tSync('notifications.magicLinkTitle', { address: inbox.address })
+                  : tSync('notifications.newEmailTitle', { address: inbox.address }),
+                message: `${msg.from_name || tSync('notifications.unknownSender')}: ${
+                  msg.subject || tSync('notifications.noSubject')
+                }`,
                 priority: 0,
-                contextMessage: 'Click to view email',
+                contextMessage: magicUrl
+                  ? tSync('notifications.clickToOpenMagicLink')
+                  : tSync('notifications.clickToViewEmail'),
+                // Respect the soundEnabled toggle: mute the OS notification chime.
+                silent: !notificationSettings.soundEnabled,
               });
             });
-            analytics.notificationsSent = (analytics.notificationsSent || 0) + toNotify.length;
+            notificationsSentDelta += toNotify.length;
             for (const msg of toNotify) {
               await addActivityEvent('notification_sent', {
                 inboxAddress: inbox.address,
@@ -566,7 +678,19 @@ async function processNewMessages(inboxAddress: string, uniqueNewMessages: Email
       }
     }
 
-    await safeStorageSet(browser, { analytics });
+    // Apply the tallied deltas under the analytics lock so concurrent
+    // recordEmailRead / incrementAnalytic mutations aren't clobbered.
+    await withLock('analytics_lock', async () => {
+      const analytics = await getAnalyticsRecord();
+      analytics.emailsReceived = (analytics.emailsReceived || 0) + emailsReceivedDelta;
+      if (newOtpCount > 0) {
+        analytics.otpsDetected = (analytics.otpsDetected || 0) + newOtpCount;
+      }
+      if (notificationsSentDelta > 0) {
+        analytics.notificationsSent = (analytics.notificationsSent || 0) + notificationsSentDelta;
+      }
+      await safeStorageSet(browser, { analytics });
+    });
   } catch (error: unknown) {
     logError('Error processing new messages side effects:', error);
   }
@@ -592,7 +716,7 @@ export async function getStorageUsage(): Promise<{
     breakdown[key] = size;
 
     // Categorize by key prefix
-    if (key === 'storedEmails' || key === 'archivedEmails') {
+    if (key === 'storedEmails' || key === 'archivedEmails' || key === 'readEmails') {
       emailsBytes += size;
     } else if (
       key.startsWith('settings_') ||
@@ -649,7 +773,7 @@ export async function getEmailsToBeDeleted(
 
   for (const [_address, emails] of Object.entries(storedEmails)) {
     const filteredEmails = emails.filter((email: Email & { stored_at?: number }) => {
-      const emailAge = email.stored_at || email.received_at * 1000;
+      const emailAge = email.stored_at || toMs(email.received_at);
       return emailAge <= threshold;
     });
     activeEmailsToDelete += filteredEmails.length;
@@ -658,7 +782,7 @@ export async function getEmailsToBeDeleted(
   for (const [_address, emails] of Object.entries(archivedEmails)) {
     const filteredEmails = emails.filter((email: Email & { archived_at?: number }) => {
       const emailAge =
-        (email as Email & { archived_at?: number }).archived_at || email.received_at * 1000;
+        (email as Email & { archived_at?: number }).archived_at || toMs(email.received_at);
       return emailAge <= threshold;
     });
     archivedEmailsToDelete += filteredEmails.length;

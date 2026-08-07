@@ -190,6 +190,18 @@ function createDefaultPerformance() {
   };
 }
 
+// Deep-copied version of DEFAULT_ANALYTICS to prevent mutation of the constant
+function freshDefaultAnalytics(): Analytics {
+  return {
+    ...DEFAULT_ANALYTICS,
+    performance: {
+      emailFetchTimes: [...(DEFAULT_ANALYTICS.performance?.emailFetchTimes ?? [])],
+      providerLatency: { ...(DEFAULT_ANALYTICS.performance?.providerLatency ?? {}) },
+      uiRenderTimes: [...(DEFAULT_ANALYTICS.performance?.uiRenderTimes ?? [])],
+    },
+  };
+}
+
 /**
  * Gets performance metrics summary
  * @returns Object with average times for each metric
@@ -218,7 +230,7 @@ export async function resetAnalyticsData(): Promise<void> {
   try {
     await withLock('analytics_lock', async () => {
       const resetData: Analytics = {
-        ...DEFAULT_ANALYTICS,
+        ...freshDefaultAnalytics(),
         createdAt: Date.now(),
         performance: {
           emailFetchTimes: [],

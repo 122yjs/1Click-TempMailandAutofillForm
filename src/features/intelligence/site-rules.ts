@@ -4,6 +4,7 @@
  */
 
 import { browser } from 'wxt/browser';
+import { logError } from '@/utils/logger.js';
 import { normalizeDomain } from './storage.js';
 
 export interface SiteRule {
@@ -33,13 +34,19 @@ function hostMatchesPattern(domain: string, pattern: string): boolean {
   const d = normalizeDomain(domain);
   let p = (pattern || '').toLowerCase().trim();
   if (!d || !p) return false;
-  p = p
-    .replace(/^https?:\/\//, '')
-    .split('/')[0]
-    .replace(/^www\./, '');
-  if (p.startsWith('*.')) {
-    const base = p.slice(2);
-    return d === base || d.endsWith(`.${base}`);
+
+  const isWildcard = p.startsWith('*.');
+  if (isWildcard) p = p.slice(2);
+
+  p =
+    normalizeDomain(p) ||
+    p
+      .replace(/^https?:\/\//, '')
+      .split('/')[0]
+      .replace(/^www\./, '');
+
+  if (isWildcard) {
+    return d === p || d.endsWith(`.${p}`);
   }
   return d === p || d.endsWith(`.${p}`);
 }
@@ -48,7 +55,12 @@ export async function loadSiteRules(): Promise<SiteRule[]> {
   try {
     const res = (await browser.storage.local.get([KEY])) as { siteRules?: SiteRule[] };
     return Array.isArray(res.siteRules) ? res.siteRules : [];
-  } catch {
+  } catch (error) {
+    logError(
+      'Failed to load site rules',
+      undefined,
+      error instanceof Error ? error : new Error(String(error))
+    );
     return [];
   }
 }
@@ -156,6 +168,7 @@ export async function loadArchiveSchedule(): Promise<Record<string, ArchiveSched
     };
     return res.siteRuleArchiveSchedule || {};
   } catch {
+    /* ignore */
     return {};
   }
 }
@@ -175,6 +188,20 @@ export async function clearArchiveSchedule(inboxId: string): Promise<void> {
   if (!map[inboxId]) return;
   delete map[inboxId];
   await browser.storage.local.set({ [SCHEDULE_KEY]: map });
+}
+
+export async function createSmartAliasRule(
+  domainPattern: string,
+  providerId?: string | null,
+  identityId?: string | null
+): Promise<SiteRule> {
+  return await upsertSiteRule({
+    name: `Smart alias for ${domainPattern}`,
+    enabled: true,
+    domainPattern,
+    providerId: providerId || null,
+    identityId: identityId || null,
+  });
 }
 
 export { hostMatchesPattern };

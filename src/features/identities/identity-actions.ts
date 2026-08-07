@@ -1,9 +1,21 @@
 import type { Browser } from 'wxt/browser';
+import { PREFERRED_EMAIL_RANDOM_ACTIVE } from '@/utils/blocked-temp-mail-sites.js';
 import { generateDefaultAvatarDataUrl } from '@/utils/default-avatar.js';
 import { generateLocalProfileExtras } from '@/utils/locale-profile.js';
 import { logError } from '@/utils/logger.js';
 import { withLock } from '@/utils/mutex.js';
+import { randomIntBetween, randomItem } from '@/utils/secure-random.js';
 import type { Identity } from '@/utils/types.js';
+
+/** Built-in default usernames (augmented with random digits at creation). */
+export function generateDefaultUsername(firstName?: string): string {
+  const base =
+    (firstName || randomItem(['alex', 'sam', 'jordan', 'casey', 'riley', 'morgan']) || 'user')
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '')
+      .slice(0, 10) || 'user';
+  return `${base}${randomIntBetween(1000, 9999)}`;
+}
 
 export interface IdentityState {
   identities: Identity[];
@@ -73,11 +85,14 @@ export function createDefaultIdentity(): Identity {
     name: 'Default Identity',
     firstNames,
     lastNames,
+    username: generateDefaultUsername(firstPick),
     useRandomPassword: true,
     pin: extras.pin,
     country: extras.country,
     city: extras.city,
     dateOfBirth: extras.dateOfBirth,
+    // Built-in default: random any active mailbox (not a pinned address)
+    preferredEmail: PREFERRED_EMAIL_RANDOM_ACTIVE,
     // Fake profile picture so form file inputs can be filled immediately
     profilePicture: generateDefaultAvatarDataUrl('Default Identity', firstPick[0]),
     isDefault: true,
@@ -103,18 +118,29 @@ export async function loadIdentities(ext: Browser, setters: IdentitySetters): Pr
       const def = identities.find((i) => i.isDefault) || identities[0];
       if (
         def &&
-        (!def.country || !def.dateOfBirth || !def.pin || !def.city || !def.profilePicture)
+        (!def.country ||
+          !def.dateOfBirth ||
+          !def.pin ||
+          !def.city ||
+          !def.profilePicture ||
+          !def.username ||
+          def.preferredEmail === undefined)
       ) {
         const extras = generateLocalProfileExtras();
         const idx = identities.findIndex((i) => i.id === def.id);
         if (idx >= 0) {
           const firstLetter = (def.firstNames || def.name || 'D').trim()[0] || 'D';
+          const firstName = (def.firstNames || 'user').split(',')[0]?.trim() || 'user';
           identities[idx] = {
             ...def,
             country: def.country || extras.country,
             dateOfBirth: def.dateOfBirth || extras.dateOfBirth,
             pin: def.pin || extras.pin,
             city: def.city || extras.city,
+            username: def.username || generateDefaultUsername(firstName),
+            // Built-in default with unset preferred → random any active mailbox
+            preferredEmail:
+              def.preferredEmail === undefined ? PREFERRED_EMAIL_RANDOM_ACTIVE : def.preferredEmail,
             profilePicture:
               def.profilePicture || generateDefaultAvatarDataUrl(def.name || def.id, firstLetter),
             updatedAt: Date.now(),

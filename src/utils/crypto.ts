@@ -12,6 +12,7 @@ import { browser } from 'wxt/browser';
 import {
   ENCRYPTION_IV_LENGTH,
   KEY_ROTATION_INTERVAL_MS,
+  LEGACY_PBKDF2_ITERATIONS,
   PBKDF2_ITERATIONS,
   SALT_LENGTH,
 } from './constants.js';
@@ -22,7 +23,6 @@ import { logError } from './logger.js';
 // For browser extensions, we use extension storage which is more secure than localStorage
 export const MASTER_KEY_ID = '1click_master_encryption_key';
 const KEY_METADATA_ID = '1click_key_metadata';
-const _KEY_SALT_ID = '1click_key_salt';
 /** Mirrors vault-lock config key - avoid circular import with vault-lock.ts */
 const VAULT_CONFIG_KEY = 'vault_security_config';
 
@@ -52,7 +52,11 @@ async function _generateSalt(): Promise<Uint8Array> {
  * Derive a key from a master secret using PBKDF2
  * This provides better security than storing raw keys
  */
-async function _deriveKey(password: string, salt: Uint8Array): Promise<CryptoKey> {
+async function _deriveKey(
+  password: string,
+  salt: Uint8Array,
+  iterations: number = PBKDF2_ITERATIONS
+): Promise<CryptoKey> {
   const encoder = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey(
     'raw',
@@ -66,7 +70,7 @@ async function _deriveKey(password: string, salt: Uint8Array): Promise<CryptoKey
     {
       name: 'PBKDF2',
       salt: salt as BufferSource,
-      iterations: PBKDF2_ITERATIONS,
+      iterations,
       hash: 'SHA-256',
     },
     keyMaterial,
@@ -102,7 +106,14 @@ export function clearCachedMasterKey(): void {
  * Uses a combination of device-specific data and random generation
  */
 export async function getOrCreateMasterKey(): Promise<CryptoKey> {
-  if (_masterKeyPromise) return _masterKeyPromise;
+  if (_masterKeyPromise) {
+    try {
+      return await _masterKeyPromise;
+    } catch {
+      /* ignore */
+      _masterKeyPromise = null;
+    }
+  }
   _masterKeyPromise = _getOrCreateMasterKeyImpl().catch((e) => {
     _masterKeyPromise = null;
     throw e;
@@ -123,6 +134,7 @@ async function getVaultSecurityMode(): Promise<'standard' | 'password' | 'biomet
     if (mode === 'password' || mode === 'biometrics') return mode;
     return 'standard';
   } catch {
+    /* ignore */
     return 'standard';
   }
 }
@@ -430,6 +442,10 @@ export async function decrypt(encryptedBase64: string): Promise<string> {
     // Decode base64
     const combined = Uint8Array.from(atob(encryptedBase64), (c) => c.charCodeAt(0));
 
+    if (combined.length <= ENCRYPTION_IV_LENGTH) {
+      throw new Error('Invalid encrypted payload');
+    }
+
     // Extract IV (first ENCRYPTION_IV_LENGTH bytes)
     const iv = combined.slice(0, ENCRYPTION_IV_LENGTH);
     const encrypted = combined.slice(ENCRYPTION_IV_LENGTH);
@@ -458,7 +474,11 @@ export async function decrypt(encryptedBase64: string): Promise<string> {
  * Output format: "<hex-salt>:<hex-derived-key>" so the salt is stored
  * alongside the hash and verification stays deterministic.
  */
-export async function hashPassword(password: string, saltHex?: string): Promise<string> {
+export async function hashPassword(
+  password: string,
+  saltHex?: string,
+  iterations: number = PBKDF2_ITERATIONS
+): Promise<string> {
   const encoder = new TextEncoder();
   const salt = saltHex
     ? Uint8Array.from((saltHex.match(/.{2}/g) ?? []).map((b) => parseInt(b, 16)))
@@ -472,7 +492,7 @@ export async function hashPassword(password: string, saltHex?: string): Promise<
     ['deriveBits']
   );
   const derived = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
     keyMaterial,
     256
   );
@@ -482,7 +502,9 @@ export async function hashPassword(password: string, saltHex?: string): Promise<
   const keyStr = Array.from(new Uint8Array(derived))
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
-  return `${saltStr}:${keyStr}`;
+  // Format: `salt:iterations:key` so verifyPassword can re-derive with the
+  // exact count used at creation (iteration tuning is safe for old records).
+  return `${saltStr}:${iterations}:${keyStr}`;
 }
 
 /**
@@ -499,18 +521,36 @@ function timingSafeEqual(a: string, b: string): boolean {
 
 /**
  * Verify a password against a hash produced by hashPassword().
+ * Supports both the current `salt:iterations:key` format and legacy
+ * `salt:key` records created before iteration counts were embedded.
  */
 export async function verifyPassword(password: string, storedHash: string): Promise<boolean> {
-  const [saltHex] = storedHash.split(':');
-  if (!saltHex) return false;
-  const candidate = await hashPassword(password, saltHex);
-  return timingSafeEqual(candidate, storedHash);
+  const parts = storedHash.split(':');
+  if (parts.length < 2) return false;
+  const saltHex = parts[0];
+  // Legacy format had exactly 2 parts; new format has 3 with iterations.
+  const iterations =
+    parts.length >= 3 && parts[1] !== ''
+      ? Number(parts[1]) || LEGACY_PBKDF2_ITERATIONS
+      : LEGACY_PBKDF2_ITERATIONS;
+  const candidate = await hashPassword(password, saltHex, iterations);
+  if (parts.length >= 3) return timingSafeEqual(candidate, storedHash);
+  // Legacy: compare only the derived key segment (candidate is salt:iterations:key).
+  const candidateKey = candidate.split(':')[2] ?? '';
+  const storedKey = parts[1];
+  return timingSafeEqual(candidateKey, storedKey);
 }
 
 /**
  * Derive an AES-GCM CryptoKey from a user password and salt using PBKDF2.
+ * `iterations` defaults to the current constant; pass the stored vault
+ * iterations (config.iterations) to re-derive legacy records correctly.
  */
-export async function deriveKeyFromPassword(password: string, saltHex: string): Promise<CryptoKey> {
+export async function deriveKeyFromPassword(
+  password: string,
+  saltHex: string,
+  iterations: number = PBKDF2_ITERATIONS
+): Promise<CryptoKey> {
   const encoder = new TextEncoder();
   const salt = Uint8Array.from((saltHex.match(/.{2}/g) ?? []).map((b) => parseInt(b, 16)));
   const keyMaterial = await crypto.subtle.importKey(
@@ -521,7 +561,7 @@ export async function deriveKeyFromPassword(password: string, saltHex: string): 
     ['deriveKey']
   );
   return await crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
     keyMaterial,
     { name: 'AES-GCM', length: 256 },
     false,
@@ -535,9 +575,10 @@ export async function deriveKeyFromPassword(password: string, saltHex: string): 
 export async function encryptMasterKeyWithPassword(
   keyJson: string,
   password: string,
-  saltHex: string
+  saltHex: string,
+  iterations: number = PBKDF2_ITERATIONS
 ): Promise<string> {
-  const derivedKey = await deriveKeyFromPassword(password, saltHex);
+  const derivedKey = await deriveKeyFromPassword(password, saltHex, iterations);
   const iv = crypto.getRandomValues(new Uint8Array(ENCRYPTION_IV_LENGTH));
   const encoder = new TextEncoder();
   const encrypted = await crypto.subtle.encrypt(
@@ -560,18 +601,20 @@ export async function encryptMasterKeyWithPassword(
 export async function decryptMasterKeyWithPassword(
   encryptedPayload: string,
   password: string,
-  saltHex: string
+  saltHex: string,
+  iterations: number = PBKDF2_ITERATIONS
 ): Promise<string | null> {
   try {
     const [ivHex, dataHex] = encryptedPayload.split(':');
     if (!ivHex || !dataHex) return null;
     const iv = Uint8Array.from((ivHex.match(/.{2}/g) ?? []).map((b) => parseInt(b, 16)));
     const data = Uint8Array.from((dataHex.match(/.{2}/g) ?? []).map((b) => parseInt(b, 16)));
-    const derivedKey = await deriveKeyFromPassword(password, saltHex);
+    const derivedKey = await deriveKeyFromPassword(password, saltHex, iterations);
     const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, derivedKey, data);
     const decoder = new TextDecoder();
     return decoder.decode(decrypted);
   } catch {
+    /* ignore */
     return null;
   }
 }

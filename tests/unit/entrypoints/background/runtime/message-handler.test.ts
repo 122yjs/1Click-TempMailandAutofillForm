@@ -69,9 +69,19 @@ describe('requireNumber', () => {
 // ── resolveHandlerKey ────────────────────────────────────────────────────────
 
 describe('resolveHandlerKey', () => {
+  test('resolves findSiteReplay action handler', () => {
+    const msg: RuntimeMessage = { action: 'findSiteReplay' };
+    expect(resolveHandlerKey(msg)).toBe('findSiteReplay');
+  });
+
   test('resolves a known type-based handler', () => {
     const msg: RuntimeMessage = { type: 'createInbox' };
     expect(resolveHandlerKey(msg)).toBe('createInbox');
+  });
+
+  test('resolves createInboxWithGesture type-based handler', () => {
+    const msg: RuntimeMessage = { type: 'createInboxWithGesture' };
+    expect(resolveHandlerKey(msg)).toBe('createInboxWithGesture');
   });
 
   test('resolves a known action-based handler (direct)', () => {

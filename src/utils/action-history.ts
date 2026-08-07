@@ -68,13 +68,14 @@ export async function revertLastAction(ext: Browser): Promise<boolean> {
     await ext.storage.local.set(restore);
     return true;
   } catch {
+    /* ignore */
     return false;
   }
 }
 
 export async function hardResetFromBoundary(ext: Browser): Promise<void> {
   try {
-    await ext.runtime.sendMessage({ action: 'hardReset' });
+    await ext.runtime.sendMessage({ type: 'hardReset' });
   } catch {
     /* ignore */
   }

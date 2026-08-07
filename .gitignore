@@ -11,3 +11,11 @@ package-lock.json
 
 .DS_Store
 *.log
+i18n-fit-report.json
+
+docs/BUNDLE_OPTIMIZATION.md
+docs/OTP_EXTRACTION.md
+docs/TEST_COVERAGE_PLAN.md
+
+scripts/gen-icons.py
+

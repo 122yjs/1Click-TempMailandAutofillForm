@@ -1,20 +1,18 @@
 /**
  * Translation utilities for non-Svelte contexts (background, content scripts, utilities).
- * Locales are statically imported so content-script bundles always include them.
  *
- * IMPORTANT: Language is stored as both `preferredLanguage` (legacy UI key) and
+ * Locale strategy: English (`en.json`) is statically imported as the universal
+ * fallback so tSync() always works — even if dynamic imports fail at runtime.
+ * The other 7 locales are dynamically imported and code-split, so only the
+ * active locale + English are loaded at startup (~155 KB vs ~640 KB if all
+ * 8 were statically imported).
+ *
+ * IMPORTANT: Language is stored as both `preferredLanguage` (LanguageSwitcher legacy) and
  * `locale` (canonical). Always resolve via resolveStoredLocale().
  */
 
 import { browser } from 'wxt/browser';
-import ar from '../locales/ar.json';
-import de from '../locales/de.json';
 import en from '../locales/en.json';
-import es from '../locales/es.json';
-import fr from '../locales/fr.json';
-import ja from '../locales/ja.json';
-import th from '../locales/th.json';
-import zh from '../locales/zh.json';
 import { logError } from './logger.js';
 
 type LocaleTree = Record<string, unknown>;
@@ -22,6 +20,21 @@ type LocaleTree = Record<string, unknown>;
 /** Supported language codes shipped in the extension. */
 export const SUPPORTED_LOCALES = ['en', 'es', 'fr', 'de', 'ja', 'zh', 'ar', 'th'] as const;
 export type SupportedLocale = (typeof SUPPORTED_LOCALES)[number];
+
+/**
+ * Dynamic loaders for non-English locales. Using dynamic import() here means
+ * Vite creates a separate chunk per locale and only loads the requested one.
+ * English is statically imported as the fallback (see above).
+ */
+const LOCALE_LOADERS: Record<string, () => Promise<unknown>> = {
+  es: () => import('../locales/es.json'),
+  fr: () => import('../locales/fr.json'),
+  de: () => import('../locales/de.json'),
+  ja: () => import('../locales/ja.json'),
+  zh: () => import('../locales/zh.json'),
+  ar: () => import('../locales/ar.json'),
+  th: () => import('../locales/th.json'),
+};
 
 /** Normalize Vite/JSON module shapes (`default` wrapper or plain object). */
 function asTree(mod: unknown): LocaleTree {
@@ -31,18 +44,7 @@ function asTree(mod: unknown): LocaleTree {
   return mod as LocaleTree;
 }
 
-const LOCALE_TABLE: Record<string, LocaleTree> = {
-  en: asTree(en),
-  ar: asTree(ar),
-  de: asTree(de),
-  es: asTree(es),
-  fr: asTree(fr),
-  ja: asTree(ja),
-  zh: asTree(zh),
-  th: asTree(th),
-};
-
-// Cache for loaded translations (copy of static tables + any future dynamic)
+// Cache for loaded translations
 const translationCache = new Map<string, LocaleTree>();
 
 /** Last known locale for tSync when locale arg is omitted. */
@@ -54,13 +56,13 @@ export function mapToSupportedLocale(raw: string | null | undefined): string {
     .trim()
     .split(/[-_]/)[0]
     .toLowerCase();
-  if (code && code in LOCALE_TABLE) return code;
+  if (code && (LOCALE_LOADERS[code] || code === 'en')) return code;
   return 'en';
 }
 
 /**
  * Resolve the user's language from storage (or a storage snapshot).
- * Accepts both canonical `locale` and legacy `preferredLanguage`.
+ * Priority: preferredLanguage → locale → page/navigator language → en
  */
 export function resolveStoredLocale(snap?: {
   locale?: string;
@@ -75,7 +77,7 @@ export function resolveStoredLocale(snap?: {
  * Get the current locale from storage (extension preference).
  * Priority: preferredLanguage → locale → page/navigator language → en
  */
-export async function getCurrentLocale(): Promise<string> {
+export async function getStoredLocaleAsync(): Promise<string> {
   try {
     const result = (await browser.storage.local.get(['locale', 'preferredLanguage'])) as {
       locale?: string;
@@ -90,16 +92,14 @@ export async function getCurrentLocale(): Promise<string> {
       const navLang = typeof navigator !== 'undefined' ? navigator.language : '';
       const fromPage = mapToSupportedLocale(docLang || navLang);
       if (fromPage && (docLang || navLang)) {
-        // Only use page/nav if it maps to a real non-default preference signal
-        if (mapToSupportedLocale(docLang || navLang) !== 'en' || docLang || navLang) {
-          return mapToSupportedLocale(docLang || navLang);
-        }
+        return fromPage;
       }
     } else if (typeof navigator !== 'undefined' && navigator.language) {
       return mapToSupportedLocale(navigator.language);
     }
     return 'en';
   } catch {
+    /* ignore */
     return 'en';
   }
 }
@@ -119,25 +119,49 @@ export async function persistLocale(langCode: string): Promise<string> {
 }
 
 /**
- * Load translations for a specific locale
+ * The English locale is always statically available as a fallback.
+ * Non-English locales are loaded lazily via dynamic import.
+ */
+const EN_TREE: LocaleTree = asTree(en);
+
+/**
+ * Load translations for a specific locale (dynamic import — only loads
+ * the requested locale chunk, not all locales).
  */
 async function loadTranslations(locale: string): Promise<LocaleTree> {
   const code = mapToSupportedLocale(locale);
+
+  // English is always available via static import
+  if (code === 'en') {
+    if (!translationCache.has('en')) {
+      translationCache.set('en', EN_TREE);
+    }
+    return translationCache.get('en') ?? EN_TREE;
+  }
+
+  // Check cache first
   if (translationCache.has(code)) {
     return translationCache.get(code) ?? {};
   }
 
-  const tree = LOCALE_TABLE[code] || LOCALE_TABLE.en;
-  if (!tree) {
-    logError(`No locale pack for ${code}`, undefined);
-    return {};
+  // Ensure English fallback is cached
+  if (!translationCache.has('en')) {
+    translationCache.set('en', EN_TREE);
   }
-  translationCache.set(code, tree);
-  // Always keep English cached as fallback
-  if (code !== 'en' && !translationCache.has('en')) {
-    translationCache.set('en', LOCALE_TABLE.en);
+
+  try {
+    const loader = LOCALE_LOADERS[code];
+    if (!loader) {
+      return EN_TREE;
+    }
+    const mod = await loader();
+    const tree = asTree(mod);
+    translationCache.set(code, tree);
+    return tree;
+  } catch (e) {
+    logError(`Failed to load locale pack for ${code}`, e);
+    return EN_TREE;
   }
-  return tree;
 }
 
 /**
@@ -172,7 +196,7 @@ export async function t(
   vars?: Record<string, string | number>,
   locale?: string
 ): Promise<string> {
-  const targetLocale = mapToSupportedLocale(locale || (await getCurrentLocale()));
+  const targetLocale = mapToSupportedLocale(locale || (await getStoredLocaleAsync()));
   cachedLocale = targetLocale;
   const translations = await loadTranslations(targetLocale);
 
@@ -216,10 +240,7 @@ export function tSync(
     if (found !== undefined) return interpolate(found, vars);
   }
 
-  // Static English pack as last resort (always available)
-  const enFound = lookupInTree(LOCALE_TABLE.en, key);
-  if (enFound !== undefined) return interpolate(enFound, vars);
-
+  // English is always statically available; check cache first, then EN_SYNC_FALLBACKS
   const fallback = EN_SYNC_FALLBACKS[key];
   if (fallback) return interpolate(fallback, vars);
 
@@ -264,7 +285,9 @@ try {
     const next = mapToSupportedLocale(nextRaw);
     clearTranslationCache();
     setCachedLocale(next);
-    void preloadTranslations(next);
+    void preloadTranslations(next).catch((e: unknown) =>
+      logError('Failed to reload translations after locale change', e)
+    );
   });
 } catch {
   /* storage may be unavailable in some test contexts */

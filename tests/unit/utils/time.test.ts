@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, test } from 'bun:test';
 import { t } from '@/utils/i18n-utils';
-import { formatDate, formatTimeLeft, getEmailStatus, timeAgo } from '@/utils/time';
+import { formatTimeLeft, getEmailStatus } from '@/utils/time';
+import { formatDate, timeAgo } from '@/utils/time-format';
 import type { Account } from '@/utils/types';
 
 beforeAll(async () => {

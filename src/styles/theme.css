@@ -421,12 +421,10 @@
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--md-primary);
+  background: color-mix(in srgb, var(--md-primary, #625b71) 60%, transparent);
   border-radius: 99px;
-  opacity: 0.7;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--md-primary);
-  opacity: 1;
+  background: var(--md-primary, #625b71);
 }

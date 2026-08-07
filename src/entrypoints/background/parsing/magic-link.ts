@@ -69,6 +69,16 @@ function stripTags(html: string): string {
 /** Normalize URL: decode entities, trim trailing punctuation. */
 export function normalizeUrl(raw: string): string | null {
   let u = decodeEntities(raw.trim());
+  let prev = '';
+  while (u !== prev) {
+    prev = u;
+    try {
+      u = decodeURIComponent(u);
+    } catch {
+      /* ignore */
+      break;
+    }
+  }
   // Strip wrapping punctuation common in plain text
   u = u.replace(/^[<(["']+/, '').replace(/[>)\],"'.!?;:]+$/g, '');
   if (!u) return null;
@@ -81,6 +91,7 @@ export function normalizeUrl(raw: string): string | null {
     // Prefer https for display/open; keep original if already https
     return parsed.href;
   } catch {
+    /* ignore */
     return null;
   }
 }
@@ -94,6 +105,7 @@ function scoreUrl(
   try {
     parsed = new URL(urlStr);
   } catch {
+    /* ignore */
     return null;
   }
 
@@ -108,8 +120,8 @@ function scoreUrl(
     score -= 8;
   }
 
-  // Path / full-url positive tokens
-  if (POSITIVE_PATH.test(path) || POSITIVE_PATH.test(urlStr)) {
+  // Path positive tokens
+  if (POSITIVE_PATH.test(path)) {
     score += 5;
   }
 
@@ -212,7 +224,7 @@ export function extractMagicLinks(
         score: scored.score,
         host: scored.host,
       });
-    } else if (existing && item.label && !existing.label) {
+    } else if (existing && item.label && existing.label === existing.host) {
       existing.label = item.label;
     }
   }

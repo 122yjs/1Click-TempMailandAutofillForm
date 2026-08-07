@@ -5,6 +5,9 @@ import { browser } from 'wxt/browser';
  * Centralizes configuration and supports dynamic developer overrides.
  */
 
+/** Default MD3 primary color (seed green) used as a fallback for badge / injected UI. */
+export const DEFAULT_PRIMARY_COLOR = '#4c662b';
+
 export const DEFAULT_CONSTANTS = {
   DEBUG: false,
   EMAIL_CHECK_INTERVAL_MS: 10 * 1000,
@@ -41,7 +44,12 @@ export const DEFAULT_CONSTANTS = {
   MAX_CUSTOM_INSTANCE_URL_LENGTH: 200,
   ENCRYPTION_IV_LENGTH: 12,
   SALT_LENGTH: 16,
-  PBKDF2_ITERATIONS: 100000,
+  // OWASP 2023 recommendation for PBKDF2-HMAC-SHA256: ~600,000 iterations.
+  // (210,000 was the SHA-512 figure; this code derives with SHA-256.)
+  PBKDF2_ITERATIONS: 600_000,
+  // Iteration count used by hashes/vaults created before the SHA-256 tuning.
+  // Kept for verifying legacy records; new records embed their own count.
+  LEGACY_PBKDF2_ITERATIONS: 210_000,
   PHONE_AREA_CODE_MIN: 200,
   PHONE_AREA_CODE_MAX: 999,
   PHONE_PART_MIN: 100,
@@ -55,6 +63,10 @@ export const DEFAULT_CONSTANTS = {
   STORAGE_LIMIT: 5 * 1024 * 1024,
   MAX_FAVICON_CACHE_SIZE: 100,
   FAVICON_CACHE_EVICT_RATIO: 0.2,
+  /** Show the countdown badge when the active inbox expires within this window. */
+  NEAR_EXPIRY_BADGE_WINDOW_MS: 30 * 60 * 1000,
+  /** Amber warning tint for the near-expiry badge ("{m}m" countdown). */
+  NEAR_EXPIRY_BADGE_COLOR: '#f59e0b',
 } as const;
 
 export type ConstantKey = keyof typeof DEFAULT_CONSTANTS;
@@ -102,6 +114,8 @@ export let MAX_CUSTOM_INSTANCE_URL_LENGTH: number =
 export let ENCRYPTION_IV_LENGTH: number = DEFAULT_CONSTANTS.ENCRYPTION_IV_LENGTH;
 export let SALT_LENGTH: number = DEFAULT_CONSTANTS.SALT_LENGTH;
 export let PBKDF2_ITERATIONS: number = DEFAULT_CONSTANTS.PBKDF2_ITERATIONS;
+/** Fixed legacy iteration count (pre-tuning). Not user-overridable. */
+export const LEGACY_PBKDF2_ITERATIONS: number = DEFAULT_CONSTANTS.LEGACY_PBKDF2_ITERATIONS;
 export let PHONE_AREA_CODE_MIN: number = DEFAULT_CONSTANTS.PHONE_AREA_CODE_MIN;
 export let PHONE_AREA_CODE_MAX: number = DEFAULT_CONSTANTS.PHONE_AREA_CODE_MAX;
 export let PHONE_PART_MIN: number = DEFAULT_CONSTANTS.PHONE_PART_MIN;
@@ -115,6 +129,9 @@ export let STORAGE_CRITICAL_THRESHOLD: number = DEFAULT_CONSTANTS.STORAGE_CRITIC
 export let STORAGE_LIMIT: number = DEFAULT_CONSTANTS.STORAGE_LIMIT;
 export let MAX_FAVICON_CACHE_SIZE: number = DEFAULT_CONSTANTS.MAX_FAVICON_CACHE_SIZE;
 export let FAVICON_CACHE_EVICT_RATIO: number = DEFAULT_CONSTANTS.FAVICON_CACHE_EVICT_RATIO;
+/** Fixed window/color for the near-expiry badge. Not user-overridable. */
+export const NEAR_EXPIRY_BADGE_WINDOW_MS: number = DEFAULT_CONSTANTS.NEAR_EXPIRY_BADGE_WINDOW_MS;
+export const NEAR_EXPIRY_BADGE_COLOR: string = DEFAULT_CONSTANTS.NEAR_EXPIRY_BADGE_COLOR;
 
 export async function getConstantOverrides(): Promise<Partial<Record<ConstantKey, unknown>>> {
   try {

@@ -114,6 +114,29 @@
           "errorMessagePath": "error"
         }
       },
+      // Undocumented but live endpoint: returns the untouched raw MIME source
+      // (`source`) for a message — the filtered `fetch_email` body strips the
+      // original <head>/<style>/@media CSS and rewrites images to res.php
+      // placeholders, so we pull the raw source to keep styling intact.
+      "getEmailSource": {
+        "method": "GET",
+        "function": "get_email_source",
+        "requiredParams": {
+          "ip": "{clientIp}",
+          "agent": "{userAgent}",
+          "email_id": "{email_id}"
+        },
+        "optionalParams": {},
+        "response": {
+          "successPath": "!error",
+          "dataPath": null,
+          "fields": {}
+        },
+        "errorHandling": {
+          "errorPath": "error",
+          "errorMessagePath": "error"
+        }
+      },
       "forgetMe": {
         "method": "GET",
         "function": "forget_me",
@@ -201,6 +224,15 @@
       "responseMapping": null,
       "selectMailboxOperation": "setEmailUser",
       "selectMailboxVariable": "emailUser",
+      // The public fetch_email body is filtered server-side (styles/images
+      // stripped). Retrieve the raw MIME source per message so the extension
+      // stores/renders/exports the untouched original. Generic DSL feature:
+      // operation + id param + source path all come from this config block.
+      "rawSource": {
+        "operation": "getEmailSource",
+        "itemIdParam": "email_id",
+        "sourcePath": "source"
+      },
       // Sequence tracking enables incremental polling: the client stores the
       // highest seen `mail_id` and only fetches messages after that.
       "sequenceTracking": {
@@ -212,6 +244,9 @@
       "attachmentMapping": {
         "enabled": true,
         "path": "att_info",
+        // `att` is present in both the list (check_email) and detail
+        // (fetch_email) responses — "1" when the message has attachments.
+        "hasAttachmentFlagPath": "att",
         "fields": {
           "filename": "f",
           "mimeType": "t",
@@ -221,8 +256,10 @@
       }
     },
     "expiry": {
-      // 1 hour
+      // 1 hour address session
       "duration": 3600000,
+      // 1 hour server message retention from arrival timestamp
+      "messageRetentionDuration": 3600000,
       "renewable": true,
       "renewalMethod": "setEmailUser"
     },

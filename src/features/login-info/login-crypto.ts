@@ -8,6 +8,7 @@
  */
 
 import { browser } from 'wxt/browser';
+import { getSiteProfile } from '@/features/intelligence/storage.js';
 import { decrypt } from '@/utils/crypto.js';
 import { logError } from '@/utils/logger.js';
 import type { CredentialsHistoryItem } from '@/utils/types.js';
@@ -31,7 +32,16 @@ export async function decryptCredentials(
       try {
         password = await decrypt(password);
       } catch {
-        // Not encrypted (legacy plaintext) or decryption failed - keep as-is
+        // Decryption failed. Two cases:
+        //  1. Legacy plaintext (saved before encryption existed) — keep as-is.
+        //  2. Encrypted value whose key is gone (key rotation / vault reset) —
+        //     the raw base64 blob is NOT a usable password. Never leak it as a
+        //     password: strip it so autofill replay skips this entry instead of
+        //     filling ciphertext into a real site's password field.
+        if (looksLikeCiphertext(password)) {
+          password = undefined;
+        }
+        // else: plaintext password that happens to be short — keep as-is.
       }
     }
     result.push({ ...item, password });
@@ -55,9 +65,9 @@ export interface ReusableCredential {
 
 export type AutofillLoginPreference = 'recent' | 'listOrder';
 
-function normalizeDomain(d: string): string {
-  return (d || '').toLowerCase().replace(/^www\./, '');
-}
+import { normalizeDomain } from '@/utils/validation.js';
+
+export { normalizeDomain };
 
 /**
  * Find a saved login for a domain (optionally scoped to inboxId).
@@ -76,10 +86,11 @@ function credentialFromItem(match: CredentialsHistoryItem): ReusableCredential {
   };
 }
 
-function domainMatchesHost(itemDomain: string, want: string): boolean {
+export function domainMatchesHost(itemDomain: string, want: string): boolean {
   const itemDom = normalizeDomain(itemDomain);
-  if (!itemDom || !want) return false;
-  return itemDom === want || itemDom.endsWith(`.${want}`) || want.endsWith(`.${itemDom}`);
+  const wantDom = normalizeDomain(want);
+  if (!itemDom || !wantDom) return false;
+  return itemDom === wantDom || itemDom.endsWith(`.${wantDom}`) || wantDom.endsWith(`.${itemDom}`);
 }
 
 export async function findReusableIdentityForDomain(
@@ -114,7 +125,6 @@ export async function findSiteReplayForDomain(
     let profileLastInboxId: string | undefined;
     let profileLastIdentityId: string | undefined;
     try {
-      const { getSiteProfile } = await import('@/features/intelligence/storage.js');
       const profile = await getSiteProfile(want);
       if (profile) {
         profileLastEmail = profile.lastEmail;
@@ -207,22 +217,31 @@ export async function findSiteReplayForDomain(
  * punctuation; AES-GCM base64 output is a contiguous run of base64 chars
  * (A-Za-z0-9+/=) with no spaces and is usually >40 chars for our payload size.
  */
-function looksLikeCiphertext(value: string): boolean {
-  if (!value || value.length < 28) return false;
-  const isBase64Only = /^[A-Za-z0-9+/=_-]+$/.test(value);
+export function looksLikeCiphertext(value: string): boolean {
+  if (!value || value.length < 40) return false; // Minimum AES-GCM length for a small password
+
+  // Sample first 88 base64 chars which decode to 66 bytes
+  const sampleBase64 = value.length > 88 ? value.slice(0, 88) : value;
+  const isBase64Only = /^[A-Za-z0-9+/]+={0,2}$/.test(sampleBase64);
   if (!isBase64Only) return false;
 
   try {
-    const binary = atob(value);
-    // User passwords (even base64-encoded strings) consist of printable ASCII (32-126, \t, \n, \r).
-    // Decoded AES-GCM ciphertext contains raw random binary bytes (<32 or >126).
+    const binary = atob(sampleBase64);
+    let nonPrintableCount = 0;
     for (let i = 0; i < binary.length; i++) {
       const code = binary.charCodeAt(i);
       if ((code < 32 && code !== 9 && code !== 10 && code !== 13) || code > 126) {
-        return true;
+        nonPrintableCount++;
       }
     }
+    // AES-GCM raw binary has ~62% non-printable characters.
+    // A base64-like password will have 0% if it decodes to ASCII, or some other distribution.
+    // Use > 35% to confidently identify binary ciphertext.
+    if (nonPrintableCount / binary.length > 0.35) {
+      return true;
+    }
   } catch {
+    /* ignore */
     return false;
   }
 

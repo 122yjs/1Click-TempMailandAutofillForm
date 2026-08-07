@@ -7,8 +7,8 @@ import { browser } from 'wxt/browser';
 import { logDebug } from '@/utils/logger.js';
 
 export const STORAGE_CAPS = {
-  /** Max messages kept per inbox address */
-  maxEmailsPerInbox: 200,
+  /** Max messages kept per inbox address (must match MAX_STORED_EMAILS_PER_INBOX). */
+  maxEmailsPerInbox: 100,
   /** Max distinct inbox bags in storedEmails */
   maxInboxBags: 80,
   /** Max favicon cache entries */
@@ -17,6 +17,8 @@ export const STORAGE_CAPS = {
   maxProfilePictureChars: 220_000,
   /** Max total approximate storedEmails payload size (chars JSON) before aggressive prune */
   storedEmailsSoftBudgetChars: 4_000_000,
+  /** Per-inbox floor applied when the soft budget is exceeded. */
+  softBudgetFloorPerInbox: 50,
 } as const;
 
 export function clampProfilePictureDataUrl(dataUrl: string | null | undefined): string | null {
@@ -51,11 +53,19 @@ export function pruneStoredEmailsMap(
   const entries = Object.entries(map || {}).map(([addr, list]) => {
     const trimmed = trimEmailList((Array.isArray(list) ? list : []) as { received_at?: number }[]);
     const newest = trimmed[0]?.received_at || 0;
-    return { addr, list: trimmed as unknown[], newest, isActive: active.has(addr.toLowerCase()) };
+    return {
+      addr: addr.toLowerCase(),
+      list: trimmed as unknown[],
+      newest,
+      isActive: active.has(addr.toLowerCase()),
+      // Never prune session-scoped address bags
+      isSession: /^session_/.test(addr),
+    };
   });
 
-  // Prefer active inboxes, then by newest mail
+  // Prefer session/active inboxes, then by newest mail
   entries.sort((a, b) => {
+    if (a.isSession !== b.isSession) return a.isSession ? -1 : 1;
     if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
     return b.newest - a.newest;
   });
@@ -110,19 +120,36 @@ export async function runStorageHygiene(): Promise<{
     if (res.storedEmails) {
       const active = (res.inboxes || []).map((i) => i.address || '').filter(Boolean);
       const pruned = pruneStoredEmailsMap(res.storedEmails, active);
-      if (Object.keys(pruned).length !== Object.keys(res.storedEmails).length) {
+      // Soft budget: if the total storedEmails payload still exceeds the budget
+      // after per-inbox capping, trim every bag to a lower floor so storage never
+      // grows unbounded (the effective ingest cap is 100, but many inboxes × 100
+      // can still approach the 4M-char budget).
+      const totalChars = JSON.stringify(pruned).length;
+      let softPruned = pruned;
+      if (totalChars > STORAGE_CAPS.storedEmailsSoftBudgetChars) {
+        softPruned = Object.fromEntries(
+          Object.entries(pruned).map(([k, list]) => [
+            k,
+            trimEmailList(
+              (Array.isArray(list) ? list : []) as { received_at?: number }[],
+              STORAGE_CAPS.softBudgetFloorPerInbox
+            ),
+          ])
+        );
+      }
+      if (Object.keys(softPruned).length !== Object.keys(res.storedEmails).length) {
         emailsPruned = true;
       } else {
         // also if any list was trimmed
-        for (const k of Object.keys(pruned)) {
+        for (const k of Object.keys(softPruned)) {
           const a = res.storedEmails[k];
-          if (Array.isArray(a) && a.length !== (pruned[k]?.length || 0)) {
+          if (Array.isArray(a) && a.length !== (softPruned[k]?.length || 0)) {
             emailsPruned = true;
             break;
           }
         }
       }
-      if (emailsPruned) patch.storedEmails = pruned;
+      if (emailsPruned) patch.storedEmails = softPruned;
     }
 
     if (res.faviconCache && Object.keys(res.faviconCache).length > STORAGE_CAPS.maxFavicons) {

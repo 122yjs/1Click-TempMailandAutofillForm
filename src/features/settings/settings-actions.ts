@@ -1,13 +1,17 @@
+import disallowedDomains from '@/config/domain-policy.jsonc';
 import { DEFAULT_PROVIDER, loadProviderConfig } from '@/utils/email-service.js';
 import { ApiError, getErrorMessage, ValidationError } from '@/utils/errors.js';
 import { t } from '@/utils/i18n-utils.js';
-import { setProviderInstance as setProviderInstanceStorage } from '@/utils/instance-manager.js';
+import {
+  getEnabledInstances,
+  setProviderInstance as setProviderInstanceStorage,
+} from '@/utils/instance-manager.js';
 import {
   validateCustomInstanceName,
   validateCustomInstanceUrl,
 } from '@/utils/instance-validation.js';
 import { logError } from '@/utils/logger.js';
-import { defaultDomainKey, selectedInstanceKey } from '@/utils/storage-keys.js';
+import { defaultDomainKey } from '@/utils/storage-keys.js';
 import { debounce } from '@/utils/time.js';
 import type { Keybindings, ProviderInstance } from '@/utils/types.js';
 import { DEFAULT_KEYBINDINGS } from '@/utils/types.js';
@@ -64,6 +68,8 @@ export interface SettingsSetters {
   setDefaultDomain: (value: string) => void;
   setShowToast: (message: string, type: 'success' | 'error' | 'warning') => void;
   loadInboxes: () => Promise<void>;
+  /** Optional confirm dialog before sensitive actions (e.g. host permission). */
+  confirmAsync?: (message: string) => Promise<boolean>;
 }
 
 /**
@@ -366,20 +372,16 @@ export async function loadProviderInstances(ext: typeof browser, setters: Settin
   try {
     const { selectedProvider } = await ext.storage.local.get(['selectedProvider']);
     const provider = selectedProvider || DEFAULT_PROVIDER;
-    const response = await ext.runtime.sendMessage({ action: 'getProviderInstances', provider });
+    const response = await ext.runtime.sendMessage({ type: 'getProviderInstances', provider });
     if (response?.success) setters.setProviderInstances(response.instances || []);
-    const storageKey = selectedInstanceKey(provider);
-    const storageResult = (await ext.storage.local.get([storageKey])) as {
-      [key: string]: string | undefined;
-    };
-    const selectedInstance = storageResult[storageKey];
-    if (selectedInstance === 'random') {
-      setters.setSelectedProviderInstance('random');
-    } else if (selectedInstance) {
-      setters.setSelectedProviderInstance(selectedInstance);
+    // Selection is derived from the enabled/disabled instance pool (the
+    // blacklist) — the legacy selectedInstance_<provider> pin is retired.
+    // Exactly one enabled instance ≈ a pin; several ≈ random pool selection.
+    const enabled = await getEnabledInstances(provider);
+    if (enabled.length === 1) {
+      setters.setSelectedProviderInstance(enabled[0].id);
     } else {
       setters.setSelectedProviderInstance('random');
-      await ext.storage.local.set({ [storageKey]: 'random' });
     }
   } catch (error: unknown) {
     logError(
@@ -433,20 +435,8 @@ export async function addCustomInstance(
   const parsedUrl = new URL(url);
   const domain = parsedUrl.hostname.toLowerCase();
 
-  const blacklistedPatterns = [
-    '.tk',
-    '.ml',
-    '.ga',
-    '.cf',
-    '.gq',
-    '.xyz',
-    '.top',
-    '.zip',
-    '.mov',
-    '.exe',
-    '.bat',
-    '.sh',
-  ];
+  // JSON-driven disallowed-suffix policy (src/config/domain-policy.jsonc).
+  const blacklistedPatterns: string[] = disallowedDomains;
   const isBlacklisted = blacklistedPatterns.some(
     (pattern) => domain === pattern.replace(/^\./, '') || domain.endsWith(pattern)
   );
@@ -456,10 +446,34 @@ export async function addCustomInstance(
     return;
   }
 
+  const originPattern = `${parsedUrl.protocol}//${parsedUrl.host}/*`;
+  try {
+    const hasOrigin = await ext.permissions.contains({ origins: [originPattern] });
+    if (!hasOrigin) {
+      const origin = `${parsedUrl.protocol}//${parsedUrl.host}`;
+      if (setters.confirmAsync) {
+        const confirmed = await setters.confirmAsync(
+          await t('toasts.customInstanceHostPermission', { origin })
+        );
+        if (!confirmed) return;
+      }
+      const granted = await ext.permissions.request({ origins: [originPattern] });
+      if (!granted) {
+        setters.setShowToast(await t('errors.permissionDenied'), 'error');
+        return;
+      }
+    }
+  } catch (error) {
+    logError('Failed to request host permission for custom instance', error);
+    setters.setShowToast(await t('errors.permissionDenied'), 'error');
+    return;
+  }
+
   // Note: We removed the synchronous confirm() here because it is disallowed in background scripts/MV3.
   // The user explicitly adds this domain through the UI, so we proceed directly.
 
   const response = await ext.runtime.sendMessage({
+    type: 'addCustomInstance',
     action: 'addCustomProviderInstance',
     instance: { name: name.toLowerCase().replace(/\s+/g, '-'), displayName: name, apiUrl: url },
   });
@@ -472,7 +486,7 @@ export async function addCustomInstance(
 export async function hardReset(ext: typeof browser, setters: SettingsSetters) {
   try {
     // Send message to background script FIRST so it can reset alarms and caches before storage is cleared
-    const response = await ext.runtime.sendMessage({ action: 'hardReset' });
+    const response = await ext.runtime.sendMessage({ type: 'hardReset' });
 
     // Now clear UI storage
     await ext.storage.local.clear();
@@ -500,6 +514,7 @@ export async function exportData(ext: typeof browser) {
   try {
     await exportBackup(ext, { categories: [...ALL_BACKUP_CATEGORIES] });
   } catch {
+    /* ignore */
     throw new Error('Export failed');
   }
 }
@@ -511,6 +526,7 @@ export async function exportCategory(ext: typeof browser, category: ExportCatego
       category === 'all' ? [...ALL_BACKUP_CATEGORIES] : [category as BackupCategory];
     await exportBackup(ext, { categories });
   } catch {
+    /* ignore */
     throw new Error(`Export of ${category} failed`);
   }
 }

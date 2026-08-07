@@ -1,0 +1,14 @@
+# Normalize all text files to LF line endings in the repo regardless of OS.
+# Biome (biome.json) mandates `lineEnding: "lf"`; without this, Windows checkouts
+# introduce CRLF that fails `bun run check` formatting.
+* text=auto eol=lf
+
+# Binary assets — never normalize
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary

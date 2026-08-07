@@ -6,54 +6,21 @@
  * alias instead. If no active inbox exists, it offers to create one.
  */
 
-import { browser } from 'wxt/browser';
-import { NoActiveInboxError } from '@/utils/errors.js';
-import { t } from '@/utils/i18n-utils.js';
+import { getBlockedTempMailSite } from '@/utils/blocked-temp-mail-sites.js';
+import { getStorageViaBg, sendMessageViaBg, setStorageViaBg } from '@/utils/content-bg-bridge.js';
+import { NoActiveInboxError } from '@/utils/content-errors.js';
+import { t } from '@/utils/content-i18n.js';
+import { trustedClick } from '@/utils/dom-guard.js';
 import { logError } from '@/utils/logger.js';
+import { CONTENT_Z } from '@/utils/portal-layers.js';
 import { positionAtEndOfField, trackElementPosition } from '../dom/positioning.js';
-
-// ── Sites known to reject disposable/temporary email domains ────────────────
-// When the user is on one of these sites and types a disposable email, we show
-// a warning instead of the "use temp alias" suggestion - because the signup
-// will fail. This saves the user from wasting a temp inbox on a site that
-// won't accept it.
-//
-// This is a curated list of popular sites that block disposable email
-// providers. Users can also add their own via the autofill blocklist UI.
-const DISPOSABLE_REJECTING_DOMAINS = new Set([
-  'facebook.com',
-  'instagram.com',
-  'twitter.com',
-  'x.com',
-  'reddit.com',
-  'netflix.com',
-  'spotify.com',
-  'amazon.com',
-  'amazon.co.uk',
-  'whatsapp.com',
-  'telegram.org',
-  'discord.com',
-  'twitch.tv',
-  'github.com',
-  'linkedin.com',
-  'pinterest.com',
-  'tiktok.com',
-  'snapchat.com',
-]);
 
 /**
  * Check if the current site is known to reject disposable email domains.
  * Returns the root domain if it matches, null otherwise.
  */
 function getDisposableRejectingDomain(hostname: string): string | null {
-  // Check exact match first, then progressively strip subdomains
-  if (DISPOSABLE_REJECTING_DOMAINS.has(hostname)) return hostname;
-  const parts = hostname.split('.');
-  for (let i = 1; i < parts.length - 1; i++) {
-    const candidate = parts.slice(i).join('.');
-    if (DISPOSABLE_REJECTING_DOMAINS.has(candidate)) return candidate;
-  }
-  return null;
+  return getBlockedTempMailSite(hostname);
 }
 
 /**
@@ -65,7 +32,7 @@ function buildWarningChip(text: string): HTMLElement {
   chip.className = 'disposable-reject-warning-chip';
   chip.style.cssText = `
     position: absolute;
-    z-index: 10001;
+    z-index: ${CONTENT_Z.chip};
     background-color: var(--md-warning);
     color: var(--md-on-warning);
     padding: 4px 10px;
@@ -111,6 +78,7 @@ const REAL_EMAIL_DOMAINS = new Set([
 ]);
 
 const DISMISSED_DOMAINS_KEY = 'disposableHintDismissedDomains';
+const PREFERRED_DOMAINS_KEY = 'disposablePreferredDomains';
 const DISMISS_DURATION_MS = 5 * 60 * 1000;
 const INPUT_DEBOUNCE_MS = 350;
 
@@ -125,11 +93,13 @@ interface DismissedDomainsResponse {
   [key: string]: number;
 }
 
+import { safeId, safeName, safePlaceholder } from '@/utils/dom-safe.js';
+
 function isEmailField(input: HTMLInputElement): boolean {
   if (input.type === 'email') return true;
-  if (input.name?.toLowerCase().includes('email')) return true;
-  if (input.id?.toLowerCase().includes('email')) return true;
-  if (input.placeholder?.toLowerCase().includes('email')) return true;
+  if (safeName(input).toLowerCase().includes('email')) return true;
+  if (safeId(input).toLowerCase().includes('email')) return true;
+  if (safePlaceholder(input).toLowerCase().includes('email')) return true;
   if (input.getAttribute('autocomplete') === 'email') return true;
   return false;
 }
@@ -146,10 +116,9 @@ function getEmailDomain(value: string): string | null {
 
 async function loadDismissedDomains(): Promise<Record<string, number>> {
   try {
-    return (
-      ((await browser.storage.local.get(DISMISSED_DOMAINS_KEY)) as DismissedDomainsResponse) || {}
-    );
+    return ((await getStorageViaBg(DISMISSED_DOMAINS_KEY)) as DismissedDomainsResponse) || {};
   } catch {
+    /* ignore */
     return {};
   }
 }
@@ -166,15 +135,57 @@ async function _dismissDomain(domain: string): Promise<void> {
   try {
     const dismissed = await loadDismissedDomains();
     dismissed[domain] = Date.now();
-    await browser.storage.local.set({ [DISMISSED_DOMAINS_KEY]: dismissed });
+    await setStorageViaBg({ [DISMISSED_DOMAINS_KEY]: dismissed });
   } catch (error: unknown) {
     logError('Failed to persist dismissed domain', error);
   }
 }
 
+/** Load the set of domains where the user has accepted a temp alias suggestion. */
+async function loadPreferredDomains(): Promise<Set<string>> {
+  try {
+    const result = (await getStorageViaBg(PREFERRED_DOMAINS_KEY)) as {
+      [PREFERRED_DOMAINS_KEY]?: string[];
+    };
+    const arr = result[PREFERRED_DOMAINS_KEY];
+    return new Set(Array.isArray(arr) ? arr : []);
+  } catch {
+    /* ignore */
+    return new Set();
+  }
+}
+
+/** Check if the user has previously accepted a temp alias suggestion on this domain. */
+export async function isDomainPreferred(domain: string): Promise<boolean> {
+  const preferred = await loadPreferredDomains();
+  return preferred.has(domain.toLowerCase());
+}
+
+/** Save a domain as preferred (user accepted the temp alias suggestion). */
+async function savePreferredDomain(domain: string): Promise<void> {
+  try {
+    const preferred = await loadPreferredDomains();
+    preferred.add(domain.toLowerCase());
+    await setStorageViaBg({ [PREFERRED_DOMAINS_KEY]: Array.from(preferred) });
+  } catch (error: unknown) {
+    logError('Failed to persist preferred domain', error);
+  }
+}
+
+/** Remove a domain from the preferred list (user explicitly un-pinned). */
+export async function removePreferredDomain(domain: string): Promise<void> {
+  try {
+    const preferred = await loadPreferredDomains();
+    preferred.delete(domain.toLowerCase());
+    await setStorageViaBg({ [PREFERRED_DOMAINS_KEY]: Array.from(preferred) });
+  } catch (error: unknown) {
+    logError('Failed to remove preferred domain', error);
+  }
+}
+
 async function getActiveInbox(): Promise<InboxShape | null> {
   try {
-    const { activeInboxId, inboxes = [] } = (await browser.storage.local.get([
+    const { activeInboxId, inboxes = [] } = (await getStorageViaBg([
       'activeInboxId',
       'inboxes',
     ])) as InboxResponse;
@@ -188,9 +199,14 @@ async function getActiveInbox(): Promise<InboxShape | null> {
 
 async function createTempInbox(): Promise<InboxShape | null> {
   try {
-    const response = (await browser.runtime.sendMessage({
-      type: 'createInbox',
-    })) as { success?: boolean; inbox?: InboxShape; error?: string };
+    const response = (await sendMessageViaBg({
+      type: 'createInboxWithGesture',
+    })) as {
+      success?: boolean;
+      inbox?: InboxShape;
+      error?: string;
+      needsUserInteraction?: boolean;
+    };
     if (response?.success && response.inbox) return response.inbox;
     return null;
   } catch (error: unknown) {
@@ -204,7 +220,7 @@ function buildChip(text: string): HTMLElement {
   chip.className = 'disposable-suggest-chip';
   chip.style.cssText = `
     position: absolute;
-    z-index: 10001;
+    z-index: ${CONTENT_Z.chip};
     background-color: var(--md-primary);
     color: var(--md-on-primary);
     padding: 4px 10px;
@@ -253,6 +269,7 @@ export function attachDisposableHint(
     try {
       return await t(key, vars);
     } catch {
+      /* ignore */
       return key;
     }
   }
@@ -278,8 +295,12 @@ export function attachDisposableHint(
     }
     if (await isDomainDismissed(domain)) {
       _isDismissedForDomain = true;
-      hideChip();
-      return;
+      // Preferred domains always show the suggestion — skip dismissal
+      if (!(await isDomainPreferred(domain))) {
+        hideChip();
+        return;
+      }
+      _isDismissedForDomain = false;
     }
     _isDismissedForDomain = false;
 
@@ -313,16 +334,23 @@ export function attachDisposableHint(
   }
 
   async function showChip(): Promise<void> {
+    const isPreferred = await isDomainPreferred(currentDomain || '');
     const text = currentInbox
       ? await translate('disposable.useAddressInstead', { address: currentInbox.address })
       : await translate('disposable.createAliasInstead');
 
     if (currentChip) {
-      currentChip.textContent = text;
+      currentChip.textContent = isPreferred
+        ? `${text} · ${await translate('disposable.preferredDomain')}`
+        : text;
       return;
     }
 
     const chip = buildChip(text);
+    if (isPreferred) {
+      chip.style.backgroundColor = 'var(--md-primary)';
+      chip.style.boxShadow = '0 0 0 2px var(--md-on-primary), 0 2px 8px rgba(0,0,0,0.15)';
+    }
     chip.onmouseover = () => {
       chip.style.filter = 'brightness(0.9)';
     };
@@ -336,11 +364,14 @@ export function attachDisposableHint(
       chip.style.transform = 'scale(1)';
     };
 
-    chip.addEventListener('click', async (event: MouseEvent) => {
-      event.preventDefault();
-      event.stopPropagation();
-      await acceptChip();
-    });
+    chip.addEventListener(
+      'click',
+      trustedClick(async (event: MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        await acceptChip();
+      })
+    );
 
     positionChip(chip, field, updatePositionListeners);
     document.body.appendChild(chip);
@@ -349,6 +380,7 @@ export function attachDisposableHint(
 
   async function acceptChip(): Promise<void> {
     if (!currentDomain) return;
+    const domainToDismiss = currentDomain;
     try {
       let inbox = currentInbox || (await getActiveInbox());
       if (!inbox) {
@@ -361,6 +393,9 @@ export function attachDisposableHint(
       field.value = inbox.address;
       field.dispatchEvent(new Event('input', { bubbles: true }));
       field.dispatchEvent(new Event('change', { bubbles: true }));
+      await _dismissDomain(domainToDismiss);
+      // Remember this domain as preferred so the chip shows again in future
+      await savePreferredDomain(domainToDismiss);
       if (currentChip?.parentNode) {
         currentChip.parentNode.removeChild(currentChip);
       }

@@ -139,7 +139,7 @@ describe('getRootDomain', () => {
   });
 
   test('handles .gov.uk TLD', () => {
-    expect(getRootDomain('www.gov.uk')).toBe('gov.uk');
+    expect(getRootDomain('service.gov.uk')).toBe('service.gov.uk');
   });
 });
 

@@ -1,12 +1,11 @@
 export type View =
-  | 'main'
-  | 'mailSettings'
+  | 'mailbox'
+  | 'addresses'
   | 'settings'
   | 'analytics'
   | 'loginInfo'
-  | 'archivedEmails'
-  | 'emailDetail'
-  | 'messageDetail'
+  | 'addressView'
+  | 'mailView'
   | 'about'
   | 'identities'
   /** Autofill manager: Profiles + Credentials tabs */
@@ -17,10 +16,14 @@ export type View =
   | 'mailProvider'
   | 'storagePerformance'
   | 'labelManagement'
-  | 'mailboxManagement'
   | 'constantsSettings'
   | 'diagnostics'
   /** Unified Tags / Labels / Filters hub */
   | 'organize'
+  /** Automation rules hub */
+  | 'automation'
   /** QA autofill playground */
   | 'playground';
+
+export type AutofillTab = 'profiles' | 'credentials';
+export type OrganizeTab = 'tags' | 'labels' | 'filters';

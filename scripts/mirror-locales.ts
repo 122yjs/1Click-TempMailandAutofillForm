@@ -6,10 +6,10 @@
  */
 import { join } from 'node:path';
 
-const LOCALES_DIR = join(import.meta.dir, '..', 'src', 'lib', 'locales');
+const LOCALES_DIR = join(import.meta.dir, '..', 'src', 'locales');
 
 const SOURCE = 'en';
-const LOCALES = ['ar', 'de', 'es', 'fr', 'ja', 'zh'];
+const LOCALES = ['ar', 'de', 'es', 'fr', 'ja', 'th', 'zh'];
 
 /** Deep merge: target gets new keys from source, but values are NOT overwritten. */
 function mergeKeys(target, source) {

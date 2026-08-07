@@ -40,7 +40,7 @@ export async function hasUnlimitedStoragePermission(): Promise<boolean> {
  * Firefox does not use the unlimitedStorage permission (large quota by default).
  */
 export function isFirefox(): boolean {
-  return navigator.userAgent.toLowerCase().includes('firefox');
+  return typeof navigator !== 'undefined' && navigator.userAgent.toLowerCase().includes('firefox');
 }
 
 /**
@@ -152,17 +152,25 @@ export async function safeStorageSet(
   data: Record<string, unknown>
 ): Promise<boolean> {
   try {
-    // Basic estimation: serialize the data to write
-    const estimatedSize = JSON.stringify(data).length;
-    const check = await beforeStorageWrite(estimatedSize);
+    const hasUnlimited = await hasUnlimitedStoragePermission();
+    if (!hasUnlimited) {
+      let estimatedSize = 0;
+      try {
+        estimatedSize = JSON.stringify(data).length;
+      } catch (err) {
+        logError('safeStorageSet: Could not stringify data for size estimation', err);
+        // Fallback size estimation or fail gracefully? We'll assume a safe fallback size or 0
+      }
+      const check = await beforeStorageWrite(estimatedSize);
 
-    if (check.shouldPromptPermission) {
-      await ext.storage.local.set({ storageQuotaWarning: true });
-    }
+      if (check.shouldPromptPermission) {
+        await ext.storage.local.set({ storageQuotaWarning: true });
+      }
 
-    if (!check.canWrite) {
-      logError('safeStorageSet: Write blocked due to storage quota limits.');
-      return false;
+      if (!check.canWrite) {
+        logError('safeStorageSet: Write blocked due to storage quota limits.');
+        return false;
+      }
     }
 
     await ext.storage.local.set(data);

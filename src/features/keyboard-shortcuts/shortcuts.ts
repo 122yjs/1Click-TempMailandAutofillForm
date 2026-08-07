@@ -9,6 +9,9 @@ export interface ShortcutsState {
   confirmDialog: { message: string; onConfirm: () => void } | null;
   selectedMessage: Email[] | null;
   currentEmailDetail: Account | null;
+  /** True when ANY blocking modal/dialog is open (create inbox, tag, import,
+   * export, master password, etc.). Global nav/letter shortcuts are suppressed. */
+  modalOpen: boolean;
 }
 
 export interface ShortcutsCallbacks {
@@ -55,13 +58,13 @@ export function handleKeydown(
       target.isContentEditable);
 
   // Refresh inbox
-  if (matchesKeybinding(event, keybindings.refreshInbox)) {
+  if (matchesKeybinding(event, keybindings.refreshInbox) && !typingInField && !state.modalOpen) {
     event.preventDefault();
     callbacks.refreshInbox();
     return;
   }
   // Create new inbox
-  if (matchesKeybinding(event, keybindings.createInbox)) {
+  if (matchesKeybinding(event, keybindings.createInbox) && !typingInField && !state.modalOpen) {
     event.preventDefault();
     callbacks.createInbox();
     return;
@@ -82,15 +85,17 @@ export function handleKeydown(
   // Navigation shortcuts (Alt+Shift — avoid browser/site conflicts)
   if (
     !typingInField &&
+    !state.modalOpen &&
     keybindings.openAddresses &&
     matchesKeybinding(event, keybindings.openAddresses)
   ) {
     event.preventDefault();
-    callbacks.setCurrentView('mailSettings');
+    callbacks.setCurrentView('addresses');
     return;
   }
   if (
     !typingInField &&
+    !state.modalOpen &&
     keybindings.openIdentities &&
     matchesKeybinding(event, keybindings.openIdentities)
   ) {
@@ -100,6 +105,7 @@ export function handleKeydown(
   }
   if (
     !typingInField &&
+    !state.modalOpen &&
     keybindings.openSavedLogins &&
     matchesKeybinding(event, keybindings.openSavedLogins)
   ) {
@@ -109,6 +115,7 @@ export function handleKeydown(
   }
   if (
     !typingInField &&
+    !state.modalOpen &&
     keybindings.toggleAccountSelector &&
     matchesKeybinding(event, keybindings.toggleAccountSelector)
   ) {
@@ -118,6 +125,7 @@ export function handleKeydown(
   }
   if (
     !typingInField &&
+    !state.modalOpen &&
     keybindings.focusSearch &&
     matchesKeybinding(event, keybindings.focusSearch)
   ) {
@@ -126,8 +134,15 @@ export function handleKeydown(
     return;
   }
 
-  // "/" always focuses search (Gmail-style), any page — not while typing
-  if (!typingInField && event.key === '/' && !event.ctrlKey && !event.metaKey && !event.altKey) {
+  // "/" always focuses search (Gmail-style), any page — not while typing / modal
+  if (
+    !typingInField &&
+    !state.modalOpen &&
+    event.key === '/' &&
+    !event.ctrlKey &&
+    !event.metaKey &&
+    !event.altKey
+  ) {
     event.preventDefault();
     callbacks.focusSearch?.();
     return;
@@ -136,6 +151,7 @@ export function handleKeydown(
   // j / k navigate message list (mailbox or split detail)
   if (
     !typingInField &&
+    !state.modalOpen &&
     !event.ctrlKey &&
     !event.metaKey &&
     !event.altKey &&
@@ -151,24 +167,33 @@ export function handleKeydown(
 
   // Escape: Close dialogs
   if (matchesKeybinding(event, keybindings.closeDialogs)) {
-    if (state.currentView === 'mailSettings') {
-      callbacks.setCurrentView('main');
+    if (state.modalOpen) {
+      // Only allow dialog-close actions while a modal is open; suppress the
+      // view-navigation Escape (the modal's own handler closes itself).
+      if (state.qrDialogOpen) {
+        callbacks.closeQrDialog();
+      } else if (state.confirmDialog) {
+        callbacks.closeConfirm();
+      }
+    } else if (state.currentView === 'addresses') {
+      callbacks.setCurrentView('mailbox');
       callbacks.setSelectedAddresses(new Set());
       callbacks.setMgmtSearch('');
     } else if (
       state.currentView === 'settings' ||
       state.currentView === 'analytics' ||
       state.currentView === 'loginInfo' ||
-      state.currentView === 'archivedEmails' ||
       state.currentView === 'about' ||
-      state.currentView === 'identities'
+      state.currentView === 'identities' ||
+      state.currentView === 'automation' ||
+      state.currentView === 'organize'
     ) {
-      callbacks.setCurrentView('main');
-    } else if (state.currentView === 'emailDetail') {
-      callbacks.setCurrentView('mailSettings');
+      callbacks.setCurrentView('mailbox');
+    } else if (state.currentView === 'addressView') {
+      callbacks.setCurrentView('addresses');
       callbacks.setCurrentEmailDetail(null);
-    } else if (state.currentView === 'messageDetail') {
-      callbacks.setCurrentView('main');
+    } else if (state.currentView === 'mailView') {
+      callbacks.setCurrentView('mailbox');
       callbacks.setSelectedMessage(null);
     } else if (state.qrDialogOpen) {
       callbacks.closeQrDialog();

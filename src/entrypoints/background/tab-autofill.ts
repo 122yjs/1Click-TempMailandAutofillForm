@@ -3,6 +3,8 @@
  * Existing tabs often lack the content script until reload — inject or ask for refresh.
  */
 import { browser } from 'wxt/browser';
+import { DEFAULT_PRIMARY_COLOR } from '@/utils/constants.js';
+import { tSync } from '@/utils/i18n-utils.js';
 import { logDebug, logError } from '@/utils/logger.js';
 
 export type TabAutofillStatus = 'ready' | 'form' | 'no_form' | 'need_refresh' | 'blocked' | 'skip';
@@ -16,6 +18,7 @@ function isInjectableUrl(url: string | undefined): boolean {
     if (u.protocol === 'http:' || u.protocol === 'https:') return true;
     return false;
   } catch {
+    /* ignore */
     return false;
   }
 }
@@ -27,6 +30,7 @@ async function pingTab(tabId: number): Promise<boolean> {
     } | null;
     return !!res?.ok;
   } catch {
+    /* ignore */
     return false;
   }
 }
@@ -53,6 +57,7 @@ export async function checkFormOnTab(tabId: number): Promise<boolean> {
     } | null;
     return !!res?.formDetected;
   } catch {
+    /* ignore */
     return false;
   }
 }
@@ -76,9 +81,8 @@ export async function ensureTabAutofillReady(
           await browser.notifications.create(`autofill_refresh_${tabId}`, {
             type: 'basic',
             iconUrl: 'icons/icon128.png',
-            title: 'Refresh page for autofill',
-            message:
-              'This page was open before the extension was ready. Refresh the tab, then use Autofill this page.',
+            title: tSync('notifications.refreshForAutofillTitle'),
+            message: tSync('notifications.refreshForAutofillMessage'),
           });
         } catch {
           /* notifications optional */
@@ -115,7 +119,7 @@ export async function setFormBadge(tabId: number, hasForm: boolean): Promise<voi
   try {
     if (hasForm) {
       await browser.action.setBadgeText({ tabId, text: 'AF' });
-      await browser.action.setBadgeBackgroundColor({ tabId, color: '#4c662b' });
+      await browser.action.setBadgeBackgroundColor({ tabId, color: DEFAULT_PRIMARY_COLOR });
       await browser.action.setTitle({
         tabId,
         title: '1Click · Signup form detected — open popup or Autofill this page',
@@ -157,7 +161,7 @@ export async function autofillActiveTab(): Promise<{ ok: boolean; reason?: strin
   }
 
   try {
-    await browser.tabs.sendMessage(tab.id, { action: 'startSignup' });
+    await browser.tabs.sendMessage(tab.id, { type: 'startSignup', action: 'startSignup' });
     return { ok: true };
   } catch (e) {
     logError('autofillActiveTab', e);

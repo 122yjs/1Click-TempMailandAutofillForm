@@ -2,14 +2,16 @@
  * OTP input detection and autofill
  */
 
+import { t } from '@/utils/content-i18n.js';
+import { safeId, safeName, safePlaceholder } from '@/utils/dom-safe.js';
 import { logDebug } from '@/utils/logger.js';
 import { showTooltip } from '../dom/tooltip.js';
 
 /** Zip / postal / address PIN fields must never receive OTP codes. */
 function isZipOrPostalField(input: HTMLInputElement): boolean {
-  const id = (input.id || '').toLowerCase();
-  const name = (input.name || '').toLowerCase();
-  const placeholder = (input.placeholder || '').toLowerCase();
+  const id = safeId(input).toLowerCase();
+  const name = safeName(input).toLowerCase();
+  const placeholder = safePlaceholder(input).toLowerCase();
   const ariaLabel = (input.getAttribute('aria-label') || '').toLowerCase();
   const autocomplete = (input.getAttribute('autocomplete') || '').toLowerCase();
   const hay = `${id} ${name} ${placeholder} ${ariaLabel} ${autocomplete}`;
@@ -34,16 +36,58 @@ function isZipOrPostalField(input: HTMLInputElement): boolean {
   return false;
 }
 
+/** Page-level signals that we are on a verification / OTP step (email already asked). */
+function pageLooksLikeOtpStep(): boolean {
+  try {
+    const path = `${location.pathname} ${location.search} ${location.hash}`.toLowerCase();
+    if (/(otp|2fa|mfa|verify|verification|confirm.?email|enter.?code|security.?code)/.test(path)) {
+      return true;
+    }
+    const title = (document.title || '').toLowerCase();
+    if (/(verify|verification|code|otp|2fa|security)/.test(title)) return true;
+    // Short page headings
+    for (const el of Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]')).slice(
+      0,
+      12
+    )) {
+      const t = (el.textContent || '').toLowerCase();
+      if (
+        /(enter (the )?(code|otp)|verification code|one.?time|check your (email|phone)|we sent|confirm (your )?email)/.test(
+          t
+        )
+      ) {
+        return true;
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return false;
+}
+
 function looksLikeOtpField(input: HTMLInputElement): boolean {
   if (isZipOrPostalField(input)) return false;
-  const id = (input.id || '').toLowerCase();
-  const name = (input.name || '').toLowerCase();
-  const placeholder = (input.placeholder || '').toLowerCase();
+  const id = safeId(input).toLowerCase();
+  const name = safeName(input).toLowerCase();
+  const placeholder = safePlaceholder(input).toLowerCase();
   const ariaLabel = (input.getAttribute('aria-label') || '').toLowerCase();
   const autocomplete = (input.getAttribute('autocomplete') || '').toLowerCase();
   if (autocomplete === 'one-time-code') return true;
   // Prefer strong OTP keywords; treat bare "pin" only with 2fa/otp/security context
-  const strong = ['otp', 'verification', '2fa', 'two-factor', 'totp', 'mfa', 'one-time', 'onetime'];
+  const strong = [
+    'otp',
+    'verification',
+    '2fa',
+    'two-factor',
+    'totp',
+    'mfa',
+    'one-time',
+    'onetime',
+    'security code',
+    'auth code',
+    'passcode',
+    'sms code',
+  ];
   const hay = `${id} ${name} ${placeholder} ${ariaLabel} ${autocomplete}`;
   for (const keyword of strong) {
     if (hay.includes(keyword)) return true;
@@ -51,7 +95,7 @@ function looksLikeOtpField(input: HTMLInputElement): boolean {
   // "code" alone is weak — require security-ish neighbours
   if (
     (hay.includes('code') || hay.includes('pin')) &&
-    /(security|verify|login|auth|sms|email|confirm|enter)/.test(hay)
+    /(security|verify|login|auth|sms|email|confirm|enter|digit)/.test(hay)
   ) {
     return true;
   }
@@ -66,60 +110,202 @@ function looksLikeOtpField(input: HTMLInputElement): boolean {
     // Only if not labelled as address
     if (!/(address|street|city|state|country|zip|postal)/.test(hay)) return true;
   }
+
+  // Email already submitted → standalone short code field on verify step
+  // (page only asks for code, not email again)
+  if (pageLooksLikeOtpStep() && !isZipOrPostalField(input)) {
+    if (input.type === 'email') return false;
+    const maxOk = maxL === -1 || maxL === 0 || (maxL >= 4 && maxL <= 10);
+    if (
+      maxOk &&
+      (input.inputMode === 'numeric' ||
+        input.type === 'tel' ||
+        input.type === 'number' ||
+        input.type === 'text' ||
+        !input.type)
+    ) {
+      // Prefer fields without long free-text labels (username, address)
+      if (!/(user|name|address|street|password|search)/.test(hay)) {
+        // Single visible short field is common for “enter the code we emailed”
+        return true;
+      }
+    }
+  }
   return false;
 }
 
-export function findOtpInputs(): HTMLInputElement[] {
-  const oneTimeCodeInput = document.querySelector<HTMLInputElement>(
-    'input[autocomplete="one-time-code"]'
-  );
-  if (oneTimeCodeInput && !isZipOrPostalField(oneTimeCodeInput)) return [oneTimeCodeInput];
+/** Collect inputs from light DOM + open shadow roots (generic SPA OTP). */
+function queryAllInputsDeep(root: ParentNode = document): HTMLInputElement[] {
+  const out: HTMLInputElement[] = [];
+  const walk = (node: ParentNode) => {
+    try {
+      const list = node.querySelectorAll('input');
+      for (const el of Array.from(list)) {
+        if (el instanceof HTMLInputElement) out.push(el);
+      }
+      // Open shadow roots only (closed ones are inaccessible)
+      const all = node.querySelectorAll('*');
+      for (const el of Array.from(all)) {
+        const sr = (el as HTMLElement).shadowRoot;
+        if (sr) walk(sr);
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+  walk(root);
+  return out;
+}
 
-  const inputs = document.querySelectorAll<HTMLInputElement>(
-    'input[type="text"], input[type="tel"], input[type="number"], input:not([type])'
-  );
-
-  const visibleInputs = Array.from(inputs).filter((input: HTMLInputElement) => {
-    if (input.type === 'hidden' || input.disabled || input.readOnly) return false;
-    if (isZipOrPostalField(input)) return false;
+function isVisibleInput(input: HTMLInputElement): boolean {
+  if (input.type === 'hidden' || input.disabled) return false;
+  try {
     const rect = input.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  });
+    if (rect.width < 2 || rect.height < 2) return false;
+    const st = getComputedStyle(input);
+    if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+  } catch {
+    /* ignore */
+    return false;
+  }
+  return true;
+}
 
-  const keywordMatched = visibleInputs.filter(looksLikeOtpField);
+/** Find clustered single-digit OTP boxes in a shared parent (not only siblings). */
+function findDigitOtpGroup(allInputs: HTMLInputElement[]): HTMLInputElement[] {
+  // Group by parentElement
+  const byParent = new Map<Element, HTMLInputElement[]>();
+  for (const input of allInputs) {
+    if (!isVisibleInput(input)) continue;
+    if (isZipOrPostalField(input)) continue;
+    const maxL = input.maxLength;
+    const single =
+      maxL === 1 ||
+      input.getAttribute('maxlength') === '1' ||
+      (input.inputMode === 'numeric' && (maxL === 1 || maxL === -1) && input.size <= 2);
+    if (!single && maxL !== 1) continue;
+    if (input.type === 'password' || input.type === 'email') continue;
+    const parent = input.parentElement;
+    if (!parent) continue;
+    const arr = byParent.get(parent) || [];
+    arr.push(input);
+    byParent.set(parent, arr);
+    // Also grandparent (wrappers around each digit)
+    const gp = parent.parentElement;
+    if (gp) {
+      const arr2 = byParent.get(gp) || [];
+      if (!arr2.includes(input)) arr2.push(input);
+      byParent.set(gp, arr2);
+    }
+  }
+  let best: HTMLInputElement[] = [];
+  for (const group of byParent.values()) {
+    const sorted = [...group].sort((a, b) => {
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      return ra.left - rb.left || ra.top - rb.top;
+    });
+    // Dedupe
+    const uniq = Array.from(new Set(sorted));
+    if (uniq.length >= 4 && uniq.length <= 8 && uniq.length > best.length) {
+      best = uniq;
+    }
+  }
+  return best;
+}
 
+export function findOtpInputs(): HTMLInputElement[] {
+  const allDeep = queryAllInputsDeep(document);
+
+  const oneTime = allDeep.find(
+    (el) =>
+      (el.getAttribute('autocomplete') || '').toLowerCase() === 'one-time-code' &&
+      !isZipOrPostalField(el) &&
+      isVisibleInput(el)
+  );
+  if (oneTime) return [oneTime];
+
+  const visibleInputs = allDeep.filter(
+    (input) =>
+      isVisibleInput(input) &&
+      !isZipOrPostalField(input) &&
+      (input.type === 'text' ||
+        input.type === 'tel' ||
+        input.type === 'number' ||
+        !input.type ||
+        input.type === 'password')
+  );
+
+  // Password-type OTP boxes are rare but used by some sites
+  const keywordMatched = visibleInputs.filter(
+    (el) => el.type !== 'password' && looksLikeOtpField(el)
+  );
   if (keywordMatched.length > 0) return keywordMatched;
 
-  const allInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input'));
-  let potentialOtpGroup: HTMLInputElement[] = [];
+  // Digit groups (Canva / bank-style 6-box codes)
+  const digitGroup = findDigitOtpGroup(allDeep);
+  if (digitGroup.length >= 4) return digitGroup;
 
-  for (let i = 0; i < allInputs.length; i++) {
-    const input = allInputs[i];
-    if (isZipOrPostalField(input)) {
+  // Sibling chain fallback
+  let potentialOtpGroup: HTMLInputElement[] = [];
+  for (let i = 0; i < allDeep.length; i++) {
+    const input = allDeep[i];
+    if (!input || isZipOrPostalField(input) || !isVisibleInput(input)) {
       if (potentialOtpGroup.length >= 4 && potentialOtpGroup.length <= 8) return potentialOtpGroup;
       potentialOtpGroup = [];
       continue;
     }
-    if (input.type !== 'text' && input.type !== 'tel' && input.type !== 'number') {
+    if (input.type !== 'text' && input.type !== 'tel' && input.type !== 'number' && input.type) {
       if (potentialOtpGroup.length >= 4 && potentialOtpGroup.length <= 8) return potentialOtpGroup;
       potentialOtpGroup = [];
       continue;
     }
-    if (
-      input.maxLength === 1 &&
-      (input.nextElementSibling?.tagName === 'INPUT' ||
-        input.previousElementSibling?.tagName === 'INPUT')
-    ) {
+    if (input.maxLength === 1) {
       potentialOtpGroup.push(input);
     } else {
       if (potentialOtpGroup.length >= 4 && potentialOtpGroup.length <= 8) return potentialOtpGroup;
       potentialOtpGroup = [];
     }
   }
-
   if (potentialOtpGroup.length >= 4 && potentialOtpGroup.length <= 8) return potentialOtpGroup;
 
+  // Page is clearly OTP step: take first short numeric-ish field
+  if (pageLooksLikeOtpStep()) {
+    const short = visibleInputs.find((el) => {
+      if (el.type === 'password' || el.type === 'email') return false;
+      const maxL = el.maxLength;
+      return maxL === -1 || maxL === 0 || (maxL >= 4 && maxL <= 10);
+    });
+    if (short) return [short];
+  }
+
   return [];
+}
+
+function setNativeValue(input: HTMLInputElement, value: string): void {
+  try {
+    const proto = Object.getPrototypeOf(input) as HTMLInputElement;
+    const desc =
+      Object.getOwnPropertyDescriptor(proto, 'value') ||
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+    if (desc?.set) desc.set.call(input, value);
+    else input.value = value;
+  } catch {
+    /* ignore */
+    input.value = value;
+  }
+  try {
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: value }));
+  } catch {
+    /* ignore */
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  try {
+    input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+  } catch {
+    /* ignore */
+  }
 }
 
 export async function fillOtp(otp: string): Promise<void> {
@@ -129,28 +315,34 @@ export async function fillOtp(otp: string): Promise<void> {
     return;
   }
 
+  const code = String(otp || '').trim();
+  if (!code) return;
+
   if (inputs.length === 1) {
     const input = inputs[0];
-    input.value = otp;
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    const { t } = await import('@/utils/i18n-utils.js');
+    if (!input) return;
+    input.focus();
+    setNativeValue(input, code);
+
     await showTooltip(input, await t('contentAutofill.otpFilled'), false);
-  } else if (inputs.length > 1 && inputs.length >= otp.length) {
-    for (let i = 0; i < otp.length; i++) {
+  } else if (inputs.length > 1) {
+    // Fill digit-by-digit even if group size differs slightly from code length
+    const n = Math.min(inputs.length, code.length);
+    for (let i = 0; i < n; i++) {
       const input = inputs[i];
       if (input) {
-        input.value = otp[i];
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.focus();
+        setNativeValue(input, code[i] || '');
       }
     }
-    const { t: t2 } = await import('@/utils/i18n-utils.js');
-    await showTooltip(inputs[inputs.length - 1], await t2('contentAutofill.otpFilled'), false);
-  } else {
-    logDebug('Found OTP inputs, but could not decide how to fill.', {
-      numInputs: inputs.length,
-      otpLength: otp.length,
-    });
+    const last = inputs[inputs.length - 1];
+    // Remainder into last box if single leftover
+    if (code.length > inputs.length && last) {
+      last.removeAttribute('maxlength');
+      if (last.maxLength === 1) last.maxLength = code.length;
+      setNativeValue(last, code.slice(inputs.length - 1));
+    }
+
+    if (last) await showTooltip(last, await t('contentAutofill.otpFilled'), false);
   }
 }

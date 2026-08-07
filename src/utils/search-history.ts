@@ -22,6 +22,7 @@ async function readMap(): Promise<HistoryMap> {
     if (!raw || typeof raw !== 'object') return {};
     return raw;
   } catch {
+    /* ignore */
     return {};
   }
 }

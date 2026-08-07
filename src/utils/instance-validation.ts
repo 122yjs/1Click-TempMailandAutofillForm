@@ -156,6 +156,7 @@ export function isSafeFetchUrl(url: string): { ok: boolean; error?: string } {
   try {
     parsedUrl = new URL(url);
   } catch {
+    /* ignore */
     return { ok: false, error: 'Invalid URL format' };
   }
   if (parsedUrl.protocol !== 'https:') {

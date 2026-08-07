@@ -1,4 +1,4 @@
-import type { ActivityEvent, Analytics } from './types.js';
+import type { ActivityEvent, Analytics, CredentialsHistoryItem, Identity } from './types.js';
 
 /**
  * Convert analytics data to CSV format
@@ -97,6 +97,83 @@ export function exportAnalyticsToCSV(
         escapeField(website),
         escapeField(message),
         escapeField(toastType),
+      ].join(',')
+    );
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Helper to escape CSV field values safely against formula injection and delimiters.
+ */
+function escapeCsvField(field: string | null | undefined): string {
+  if (!field) return '""';
+  let val = String(field);
+  if (/^[=+\-@\t\r]/.test(val)) {
+    val = `'${val}`;
+  }
+  if (val.includes(',') || val.includes('"') || val.includes('\n') || val.includes('\r')) {
+    return `"${val.replace(/"/g, '""')}"`;
+  }
+  return `"${val}"`;
+}
+
+/**
+ * Export saved logins to Bitwarden / 1Password compatible CSV format.
+ */
+export function exportLoginsToBitwardenCSV(logins: CredentialsHistoryItem[]): string {
+  const lines: string[] = [];
+  lines.push(
+    'folder,favorite,type,name,notes,fields,login_uri,login_username,login_password,login_totp'
+  );
+
+  for (const login of logins) {
+    const name = login.name || login.domain || 'Saved Login';
+    const uri = login.website || (login.domain ? `https://${login.domain}` : '');
+    const username = login.email || login.username || '';
+    const password = login.password || '';
+    const totp = login.totpSecret || '';
+
+    lines.push(
+      [
+        '""', // folder
+        '0', // favorite
+        'login', // type
+        escapeCsvField(name),
+        '""', // notes
+        '""', // fields
+        escapeCsvField(uri),
+        escapeCsvField(username),
+        escapeCsvField(password),
+        escapeCsvField(totp),
+      ].join(',')
+    );
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Export synthetic identities to CSV format.
+ */
+export function exportIdentitiesToCSV(identities: Identity[]): string {
+  const lines: string[] = [];
+  lines.push('id,name,firstNames,lastNames,phone,pin,country,gender,dateOfBirth');
+
+  for (const identity of identities) {
+    const raw = identity as unknown as Record<string, unknown>;
+    lines.push(
+      [
+        escapeCsvField(identity.id),
+        escapeCsvField(identity.name),
+        escapeCsvField(identity.firstNames),
+        escapeCsvField(identity.lastNames),
+        escapeCsvField(identity.phone),
+        escapeCsvField(identity.pin),
+        escapeCsvField(raw.country as string),
+        escapeCsvField(raw.gender as string),
+        escapeCsvField(raw.dateOfBirth as string),
       ].join(',')
     );
   }

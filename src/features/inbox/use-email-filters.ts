@@ -6,10 +6,19 @@ import type { Email, SavedSearchFilter } from '@/utils/types.js';
 export interface FilterCriteria {
   searchQuery: string;
   otpOnly: boolean;
+  hasAttachment: boolean;
   senderDomain: string;
   senderEmail: string;
   recipient: string;
   subject: string;
+  /** Exclude emails from this sender domain (!from:domain) */
+  notSenderDomain: string;
+  /** Exclude emails from this sender email (!from:email) */
+  notSenderEmail: string;
+  /** Exclude emails to this recipient (!to:address) */
+  notRecipient: string;
+  /** Exclude emails whose subject contains this text (!subject:text) */
+  notSubject: string;
   selectedSenders: string[];
   dateFrom: string;
   dateTo: string;
@@ -22,6 +31,8 @@ export interface EmailFiltersState {
   searchQuery: string;
   /** OTP-only filter */
   otpOnly: boolean;
+  /** Has-attachment filter */
+  hasAttachment: boolean;
   /** Sender domain filter */
   senderDomain: string;
   /** Selected senders */
@@ -60,10 +71,15 @@ export function hasActiveFilter(criteria: FilterCriteria): boolean {
   return (
     criteria.searchQuery !== '' ||
     criteria.otpOnly ||
+    criteria.hasAttachment ||
     criteria.senderDomain !== '' ||
     criteria.senderEmail !== '' ||
     criteria.recipient !== '' ||
     criteria.subject !== '' ||
+    criteria.notSenderDomain !== '' ||
+    criteria.notSenderEmail !== '' ||
+    criteria.notRecipient !== '' ||
+    criteria.notSubject !== '' ||
     criteria.selectedSenders.length > 0 ||
     criteria.dateFrom !== '' ||
     criteria.dateTo !== '' ||
@@ -89,11 +105,21 @@ export function applySearchShortcuts(
   return {
     ...currentCriteria,
     searchQuery: parsed.searchQuery,
-    otpOnly: parsed.otpOnly || currentCriteria.otpOnly,
-    senderDomain: parsed.senderDomain || currentCriteria.senderDomain,
-    senderEmail: parsed.senderEmail || currentCriteria.senderEmail,
-    recipient: parsed.recipient || currentCriteria.recipient,
-    subject: parsed.subject || currentCriteria.subject,
+    // Explicit shortcut wins; absent shortcut leaves the current state alone
+    otpOnly: parsed.otpOnlySet ? parsed.otpOnly : currentCriteria.otpOnly,
+    hasAttachment: parsed.hasAttachmentSet ? parsed.hasAttachment : currentCriteria.hasAttachment,
+    // Value shortcuts (from:/to:/subject: and their negated ! forms) are the
+    // ONLY writers of these fields — there are no dedicated chips — so the raw
+    // query is the source of truth: a present token sets it, an absent token
+    // clears it. This makes pill removal round-trip cleanly.
+    senderDomain: parsed.senderDomainSet ? parsed.senderDomain : '',
+    senderEmail: parsed.senderDomainSet ? parsed.senderEmail : '',
+    recipient: parsed.recipientSet ? parsed.recipient : '',
+    subject: parsed.subjectSet ? parsed.subject : '',
+    notSenderDomain: parsed.senderDomainSet ? parsed.notSenderDomain : '',
+    notSenderEmail: parsed.senderDomainSet ? parsed.notSenderEmail : '',
+    notRecipient: parsed.recipientSet ? parsed.notRecipient : '',
+    notSubject: parsed.subjectSet ? parsed.notSubject : '',
   };
 }
 
@@ -126,22 +152,34 @@ export async function loadSavedFilters(
 export function filterSignature(f: {
   searchQuery?: string;
   hasOTP?: boolean;
+  hasAttachment?: boolean;
   senderDomain?: string;
   dateFrom?: string;
   dateTo?: string;
   selectedSenders?: string[];
   sortBy?: string;
   recipient?: string;
+  subject?: string;
+  notSenderDomain?: string;
+  notSenderEmail?: string;
+  notRecipient?: string;
+  notSubject?: string;
 }): string {
   return JSON.stringify({
     q: (f.searchQuery || '').trim().toLowerCase(),
     otp: !!f.hasOTP,
+    att: !!f.hasAttachment,
     domain: (f.senderDomain || '').trim().toLowerCase(),
     from: f.dateFrom || '',
     to: f.dateTo || '',
     senders: [...(f.selectedSenders || [])].map((s) => s.toLowerCase()).sort(),
     sort: f.sortBy || '',
     recipient: (f.recipient || '').toLowerCase(),
+    subject: (f.subject || '').toLowerCase(),
+    notDomain: (f.notSenderDomain || '').trim().toLowerCase(),
+    notEmail: (f.notSenderEmail || '').toLowerCase(),
+    notRecipient: (f.notRecipient || '').toLowerCase(),
+    notSubject: (f.notSubject || '').toLowerCase(),
   });
 }
 
@@ -214,12 +252,18 @@ export function createFilter(
   name: string,
   searchQuery: string,
   hasOTP: boolean,
+  hasAttachment: boolean,
   senderDomain: string,
   dateFrom: string,
   dateTo: string,
   selectedSenders: string[] = [],
   sortBy: string = 'newest',
-  recipient: string = ''
+  recipient: string = '',
+  subject: string = '',
+  notSenderDomain: string = '',
+  notSenderEmail: string = '',
+  notRecipient: string = '',
+  notSubject: string = ''
 ): SavedSearchFilter {
   const uuid =
     typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
@@ -231,12 +275,18 @@ export function createFilter(
     name,
     searchQuery,
     hasOTP,
+    hasAttachment,
     senderDomain,
     selectedSenders,
     dateFrom,
     dateTo,
     sortBy,
     recipient,
+    subject,
+    notSenderDomain,
+    notSenderEmail,
+    notRecipient,
+    notSubject,
     createdAt: Date.now(),
   };
 }
@@ -249,12 +299,18 @@ export function buildFilterFromCriteria(name: string, criteria: FilterCriteria):
     name,
     criteria.searchQuery,
     criteria.otpOnly,
+    criteria.hasAttachment,
     criteria.senderDomain,
     criteria.dateFrom,
     criteria.dateTo,
     criteria.selectedSenders,
     criteria.sortBy,
-    criteria.recipient
+    criteria.recipient,
+    criteria.subject,
+    criteria.notSenderDomain,
+    criteria.notSenderEmail,
+    criteria.notRecipient,
+    criteria.notSubject
   );
 }
 
@@ -265,11 +321,17 @@ export function extractCriteriaFromFilter(filter: SavedSearchFilter): Partial<Fi
   return {
     searchQuery: filter.searchQuery,
     otpOnly: filter.hasOTP,
+    hasAttachment: !!filter.hasAttachment,
     senderDomain: filter.senderDomain,
     selectedSenders: filter.selectedSenders || [],
     dateFrom: filter.dateFrom,
     dateTo: filter.dateTo,
     sortBy: filter.sortBy || 'newest',
     recipient: filter.recipient || '',
+    subject: filter.subject || '',
+    notSenderDomain: filter.notSenderDomain || '',
+    notSenderEmail: filter.notSenderEmail || '',
+    notRecipient: filter.notRecipient || '',
+    notSubject: filter.notSubject || '',
   };
 }

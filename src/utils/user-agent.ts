@@ -103,3 +103,26 @@ export function inferPlatformFromUA(ua: string): string {
   if (lower.includes('linux')) return 'Linux x86_64';
   return 'Win32'; // safe fallback
 }
+
+const UA_MAX_LENGTH = 512;
+const UA_UNSAFE_RE = /[<>`\r\n\\]/;
+
+/**
+ * User-Agent strings for page-world injection must come from identity storage presets
+ * or a short custom string — never page-derived or script-breaking content.
+ */
+export function isSafeUserAgentString(ua: string): boolean {
+  if (!ua || typeof ua !== 'string') return false;
+  const trimmed = ua.trim();
+  if (trimmed.length === 0 || trimmed.length > UA_MAX_LENGTH) return false;
+  if (UA_UNSAFE_RE.test(trimmed)) return false;
+  // Known presets + random pool
+  for (const preset of Object.values(USER_AGENT_PRESETS)) {
+    if (preset.userAgent === trimmed) return true;
+  }
+  for (const entry of RANDOM_POOL) {
+    if (entry.userAgent === trimmed) return true;
+  }
+  // Custom UA: printable ASCII only (Mozilla-style strings)
+  return /^[\x20-\x7E]+$/.test(trimmed) && trimmed.includes('Mozilla/');
+}

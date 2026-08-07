@@ -146,6 +146,7 @@ export function detectCountryLocally(): string {
     const lang = String(raw).split('-')[0] || 'en';
     return LANG_TO_COUNTRY[lang.toLowerCase()] || 'US';
   } catch {
+    /* ignore */
     return 'US';
   }
 }

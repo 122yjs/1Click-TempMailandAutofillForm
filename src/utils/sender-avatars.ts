@@ -4,6 +4,7 @@
  * falling back to earlier mail when the window is empty.
  */
 
+import { toMs } from '@/utils/time.js';
 import type { Email } from '@/utils/types.js';
 
 export type SenderAvatar = {
@@ -45,9 +46,9 @@ export function getDomainAvatarStack(
   if (list.length === 0) return { senders: [], remainder: 0 };
 
   const now = Date.now();
-  // received_at is unix seconds in this codebase
+
   const inWindow = list.filter((m) => {
-    const ts = m.received_at > 1e12 ? m.received_at : m.received_at * 1000;
+    const ts = toMs(m.received_at);
     return now - ts <= windowMs;
   });
   const pool = inWindow.length > 0 ? inWindow : list;

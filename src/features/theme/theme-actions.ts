@@ -1,5 +1,5 @@
 import { browser } from 'wxt/browser';
-import { applyThemeFromSeed } from '@/utils/theme-generator.js';
+import { applyThemeFromSeed, generateThemeColors } from '@/utils/theme-generator.js';
 
 export type ThemeMode = 'light' | 'system' | 'dark';
 export type ContrastLevel = 'standard' | 'medium' | 'high';
@@ -22,6 +22,13 @@ export interface ThemeSetters {
  * @param setters - Theme setter functions
  * @param ext - Browser extension API
  */
+/** True when the applied theme is dark (reads the resolved `data-theme` that
+ * applyTheme sets — `system` mode is already resolved to dark/light there). */
+export function isDarkThemeActive(): boolean {
+  if (typeof document === 'undefined') return false;
+  return (document.documentElement.getAttribute('data-theme') || '').startsWith('dark');
+}
+
 export async function toggleTheme(state: ThemeState, setters: ThemeSetters, ext: typeof browser) {
   let newMode: ThemeMode;
   if (state.themeMode === 'light') {
@@ -146,48 +153,9 @@ export async function applyCustomColor(customColor: string) {
   } else {
     // Remove all inline CSS custom properties set by applyThemeFromSeed
     const root = document.documentElement;
-    const propsToRemove = [
-      '--md-primary',
-      '--md-on-primary',
-      '--md-primary-container',
-      '--md-on-primary-container',
-      '--md-secondary',
-      '--md-on-secondary',
-      '--md-secondary-container',
-      '--md-on-secondary-container',
-      '--md-tertiary',
-      '--md-on-tertiary',
-      '--md-tertiary-container',
-      '--md-on-tertiary-container',
-      '--md-error',
-      '--md-on-error',
-      '--md-error-container',
-      '--md-on-error-container',
-      '--md-background',
-      '--md-on-background',
-      '--md-surface',
-      '--md-on-surface',
-      '--md-surface-variant',
-      '--md-on-surface-variant',
-      '--md-outline',
-      '--md-outline-variant',
-      '--md-surface-container-lowest',
-      '--md-surface-container-low',
-      '--md-surface-container',
-      '--md-surface-container-high',
-      '--md-surface-container-highest',
-      '--md-inverse-surface',
-      '--md-inverse-on-surface',
-      '--md-inverse-primary',
-      '--md-shadow',
-      '--md-scrim',
-      '--md-surface-bright',
-      '--md-surface-dim',
-      '--md-success',
-      '--md-on-success',
-      '--md-warning',
-      '--md-on-warning',
-    ];
+    const propsToRemove = Array.from(root.style).filter((prop) =>
+      prop.startsWith('--md-sys-color-')
+    );
     for (const prop of propsToRemove) {
       root.style.removeProperty(prop);
     }
@@ -201,48 +169,8 @@ export async function syncThemeColors(): Promise<void> {
   const computedStyle = getComputedStyle(root);
   const colors: Record<string, string> = {};
 
-  const props = [
-    '--md-primary',
-    '--md-on-primary',
-    '--md-primary-container',
-    '--md-on-primary-container',
-    '--md-secondary',
-    '--md-on-secondary',
-    '--md-secondary-container',
-    '--md-on-secondary-container',
-    '--md-tertiary',
-    '--md-on-tertiary',
-    '--md-tertiary-container',
-    '--md-on-tertiary-container',
-    '--md-error',
-    '--md-on-error',
-    '--md-error-container',
-    '--md-on-error-container',
-    '--md-background',
-    '--md-on-background',
-    '--md-surface',
-    '--md-on-surface',
-    '--md-surface-variant',
-    '--md-on-surface-variant',
-    '--md-outline',
-    '--md-outline-variant',
-    '--md-surface-container-lowest',
-    '--md-surface-container-low',
-    '--md-surface-container',
-    '--md-surface-container-high',
-    '--md-surface-container-highest',
-    '--md-inverse-surface',
-    '--md-inverse-on-surface',
-    '--md-inverse-primary',
-    '--md-shadow',
-    '--md-scrim',
-    '--md-surface-bright',
-    '--md-surface-dim',
-    '--md-success',
-    '--md-on-success',
-    '--md-warning',
-    '--md-on-warning',
-  ];
+  const dummyColors = await generateThemeColors('#000000', false, 0);
+  const props = Object.keys(dummyColors);
 
   for (const prop of props) {
     const val = root.style.getPropertyValue(prop) || computedStyle.getPropertyValue(prop);

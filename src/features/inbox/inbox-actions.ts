@@ -7,8 +7,10 @@ import { ApiError } from '@/utils/errors.js';
 import { t } from '@/utils/i18n-utils.js';
 import { logError } from '@/utils/logger.js';
 import { withLock } from '@/utils/mutex.js';
+import { parseSearchShortcuts } from '@/utils/search-shortcuts.js';
 import { getStoredEmailsMap } from '@/utils/storage-keys.js';
-import { formatDate, formatTimeLeft, getEmailStatus } from '@/utils/time.js';
+import { formatTimeLeft, getEmailStatus } from '@/utils/time.js';
+import { formatDate } from '@/utils/time-format.js';
 import type { Account, Email, NotificationSettings } from '@/utils/types.js';
 
 export interface InboxState {
@@ -141,6 +143,7 @@ async function isStillActiveInbox(ext: typeof browser, inboxId: string): Promise
     };
     return !activeInboxId || activeInboxId === inboxId;
   } catch {
+    /* ignore */
     return true;
   }
 }
@@ -292,7 +295,9 @@ export async function checkMessages(
       response = await ext.runtime.sendMessage({
         type: 'checkEmails',
         inboxId,
-        filters: { searchQuery: searchQuery.trim(), hasOTP: otpOnly },
+        // Strip shortcut tokens (is:otp, !from:x, …) — the background filter
+        // only understands free-text + hasOTP.
+        filters: { searchQuery: parseSearchShortcuts(searchQuery).searchQuery, hasOTP: otpOnly },
       });
       // Drop stale responses when user already switched accounts (prev/next spam)
       if (generation !== checkMessagesGeneration) return;
@@ -471,6 +476,7 @@ export async function selectAccount(
       const bag = resolveStoredBag(storedEmails, addrNorm);
       setters.setEmails([...mapEmailsForDisplay(bag, readEmails, addrNorm)]);
     } catch {
+      /* ignore */
       setters.setEmails([]);
     }
     setters.setLatestOtp('------');
@@ -480,7 +486,7 @@ export async function selectAccount(
 
 export async function copyEmail(selectedEmail: string, showToast: (message: string) => void) {
   try {
-    await navigator.clipboard.writeText(selectedEmail);
+    await copyToClipboardAndSchedulePurge(selectedEmail);
     showToast(await t('toasts.emailCopiedToClipboard'));
   } catch (error) {
     logError(
@@ -768,7 +774,7 @@ export async function autofillForm(
     .then(async ([tab]: Array<{ id?: number }>) => {
       if (tab?.id) {
         ext.tabs
-          .sendMessage(tab.id, { action: 'startSignup', email: selectedEmail })
+          .sendMessage(tab.id, { type: 'startSignup', action: 'startSignup', email: selectedEmail })
           .then(async () => showToast(await t('toasts.autofillStarted'), 'success'))
           .catch(async () => showToast(await t('toasts.autofillFailedNoContentScript'), 'error'));
       } else {
@@ -786,57 +792,82 @@ export async function applyEmailLocalAction(
   action: EmailLocalAction
 ): Promise<{ updated: number; notFound: number }> {
   if (emails.length === 0) return { updated: 0, notFound: 0 };
-  return withLock('stored_emails_lock', async () => {
-    const storedEmails = await getStoredEmailsMap();
+  return withLock('emails_storage_lock', async () => {
+    const { storedEmails = {}, archivedEmails = {} } = (await ext.storage.local.get([
+      'storedEmails',
+      'archivedEmails',
+    ])) as {
+      storedEmails?: Record<string, Email[]>;
+      archivedEmails?: Record<string, Email[]>;
+    };
     const now = Date.now();
     let updated = 0;
     let notFound = 0;
 
     for (const email of emails) {
-      let addr = email.original_inbox;
-      let list = addr ? storedEmails[addr] : undefined;
-      let idx = list ? list.findIndex((e: Email) => e.id === email.id) : -1;
+      const rawAddr = email.original_inbox || (email as Email & { address?: string }).address || '';
+      const normAddr = rawAddr.toLowerCase();
 
-      // Fallback: search all inboxes for the email by id (covers older stored
-      // emails that were stored before storeNewMessages stamped original_inbox).
-      if (idx === -1) {
-        for (const [candidateAddr, candidateList] of Object.entries(storedEmails)) {
-          const candidateIdx = (candidateList as Email[]).findIndex((e) => e.id === email.id);
-          if (candidateIdx !== -1) {
-            addr = candidateAddr;
-            list = candidateList as Email[];
-            idx = candidateIdx;
-            // Stamp original_inbox on the stored copy so future lookups are fast
-            (list[idx] as Email & Record<string, unknown>).original_inbox = candidateAddr;
-            break;
+      const mutateInMap = (map: Record<string, Email[]>): boolean => {
+        for (const [key, list] of Object.entries(map)) {
+          if (normAddr && key.toLowerCase() !== normAddr) continue;
+          if (!Array.isArray(list)) continue;
+          const idx = list.findIndex((e) => e.id === email.id);
+          if (idx !== -1) {
+            const target = { ...list[idx] } as Email & Record<string, unknown>;
+            if (action === 'archive') {
+              target.local_archived = true;
+              target.local_archived_at = now;
+            } else if (action === 'delete') {
+              target.local_deleted = true;
+              target.local_deleted_at = now;
+            } else {
+              delete target.local_archived;
+              delete target.local_archived_at;
+              delete target.local_deleted;
+              delete target.local_deleted_at;
+            }
+            list[idx] = target as Email;
+            return true;
           }
         }
-      }
+        // Fallback: search across all keys if normAddr filter had zero hits
+        for (const [key, list] of Object.entries(map)) {
+          if (!Array.isArray(list)) continue;
+          const idx = list.findIndex((e) => e.id === email.id);
+          if (idx !== -1) {
+            const target = { ...list[idx], original_inbox: key } as Email & Record<string, unknown>;
+            if (action === 'archive') {
+              target.local_archived = true;
+              target.local_archived_at = now;
+            } else if (action === 'delete') {
+              target.local_deleted = true;
+              target.local_deleted_at = now;
+            } else {
+              delete target.local_archived;
+              delete target.local_archived_at;
+              delete target.local_deleted;
+              delete target.local_deleted_at;
+            }
+            list[idx] = target as Email;
+            return true;
+          }
+        }
+        return false;
+      };
 
-      if (idx === -1 || !list || !addr) {
-        notFound++;
-        continue;
-      }
+      const foundInStored = mutateInMap(storedEmails);
+      const foundInArchived = !foundInStored ? mutateInMap(archivedEmails) : false;
 
-      const target = list[idx] as Email & Record<string, unknown>;
-      if (action === 'archive') {
-        target.local_archived = true;
-        target.local_archived_at = now;
-      } else if (action === 'delete') {
-        target.local_deleted = true;
-        target.local_deleted_at = now;
+      if (foundInStored || foundInArchived) {
+        updated++;
       } else {
-        delete target.local_archived;
-        delete target.local_archived_at;
-        delete target.local_deleted;
-        delete target.local_deleted_at;
+        notFound++;
       }
-      list[idx] = target as Email;
-      updated++;
     }
 
     if (updated > 0) {
-      await ext.storage.local.set({ storedEmails });
+      await ext.storage.local.set({ storedEmails, archivedEmails });
     }
     return { updated, notFound };
   });

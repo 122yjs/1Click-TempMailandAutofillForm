@@ -186,6 +186,12 @@ export interface Account {
   emailUser?: string;
   /** How many times this inbox was successfully renewed (auto or manual) */
   renewalCount?: number;
+  /** Measured renewal latency (ms) — adaptive auto-renew pre-expiry window. */
+  renewalLatencyMs?: number;
+  /** When the last renewal operation completed (ms epoch). */
+  lastRenewalAt?: number;
+  /** Consecutive auto-renew failures (to break the zombie-expiry loop). */
+  renewalFailCount?: number;
 }
 
 /** Detected one-click / magic sign-in link on a message */
@@ -204,16 +210,26 @@ export interface Email {
   body?: string;
   body_html?: string;
   body_plain?: string;
+  /** Untouched raw MIME source of the message, when the provider exposes it
+   * (e.g. GuerrillaMail's `get_email_source`). Preserves the original
+   * styling/structure that server-filtered `mail_body` responses strip out. */
+  raw_source?: string;
   from?: string;
   from_name?: string;
   received_at: number; // Unix seconds
   otp?: string | null;
   /** Estimated OTP validity end (ms epoch) from body heuristics */
   otpExpiresAt?: number;
+  /** Server message availability expiry (ms epoch) derived from arrival + messageRetentionDuration */
+  messageExpiresAt?: number;
   /** Ranked magic / sign-in links extracted from the body */
   magicLinks?: MagicLink[];
   /** True when at least one magic link was detected */
   hasMagicLink?: boolean;
+  /** True when the provider's list response flagged this message as having
+   * attachments (e.g. Guerrilla `att: "1"`) — known before the manifest is
+   * fetched, and survives providers that only expose the flag. */
+  hasAttachment?: boolean;
   attachments?: {
     filename: string;
     mimeType: string;
@@ -253,6 +269,11 @@ export interface Identity {
   name: string;
   firstNames: string;
   lastNames: string;
+  /**
+   * Preferred username for signup forms. Empty = generate at fill time.
+   * When a site rejects “username taken”, autofill regenerates a new one.
+   */
+  username?: string | null;
   useRandomPassword: boolean;
   customPassword?: string;
   phone?: string;
@@ -260,8 +281,9 @@ export interface Identity {
   domainHints?: string[];
   /**
    * Mailbox address to prefer when autofilling.
-   * Empty / undefined = use the currently selected (active) inbox.
-   * Must match an existing inbox address when set.
+   * - Empty / undefined = use the currently selected (active) inbox.
+   * - `__random_active__` = pick any random live (active) mailbox at fill time.
+   * - Otherwise must match an existing inbox address.
    */
   preferredEmail?: string | null;
   /** Optional form-fill profile extras */
@@ -285,6 +307,22 @@ export interface Identity {
   /** Chronological edit history (newest last, capped) */
   updateHistory?: { at: number; summary?: string }[];
   userAgent?: string | null;
+  /**
+   * Per-domain field overrides (user-defined).
+   * Maps domain or domain suffix → partial field values that override the
+   * identity's defaults when autofilling on that domain.
+   *
+   * Example: { "linkedin.com": { "firstNames": "John", "lastNames": "Smith" } }
+   */
+  domainFieldOverrides?: Record<
+    string,
+    Partial<
+      Pick<
+        Identity,
+        'firstNames' | 'lastNames' | 'username' | 'phone' | 'preferredEmail' | 'customPassword'
+      >
+    >
+  >;
 }
 
 export interface NotificationSettings {
@@ -316,123 +354,25 @@ export interface SavedSearchFilter {
   name: string;
   searchQuery: string;
   hasOTP: boolean;
+  /** When true, only emails with attachments match this filter. */
+  hasAttachment?: boolean;
   senderDomain: string;
   selectedSenders?: string[];
   dateFrom: string;
   dateTo: string;
   sortBy?: string;
   recipient?: string;
+  /** Subject text filter (subject:text) */
+  subject?: string;
+  /** Exclude emails from this sender domain (!from:domain) */
+  notSenderDomain?: string;
+  /** Exclude emails from this sender email (!from:email) */
+  notSenderEmail?: string;
+  /** Exclude emails to this recipient (!to:address) */
+  notRecipient?: string;
+  /** Exclude emails whose subject contains this text (!subject:text) */
+  notSubject?: string;
   createdAt: number;
-}
-
-// ---- Component Props Interfaces ----
-
-export interface MainViewProps {
-  selectedEmail: string;
-  emails: Email[];
-  loading: boolean;
-  latestOtp: string;
-  otpContext: string;
-  notificationsEnabled: boolean;
-  inboxes: Account[];
-  onCreateInbox: () => void;
-  onRefreshInbox: () => void;
-  onToggleNotifications: () => void;
-  onCopyEmail: () => void;
-  onOpenQrDialog: () => void;
-  onOpenEmailDetail: (account: Account) => void;
-  onEditAccount: (account: Account) => void;
-  onExtendAccount: (account: Account) => void;
-  onRemoveAccount: (address: string) => void;
-  onArchiveAccount: (account: Account) => void;
-  onOpenArchivedEmails: () => void;
-  onOpenExpiredEmails: () => void;
-  onCopyOtp: () => void;
-  onOpenMessageDetail: (thread: Email[]) => void;
-  onClearFilters: () => void;
-  dropdownOpen: boolean;
-  domainMenuOpen: boolean;
-  domainMenuPosition: { x: number; y: number };
-  filteredEmails: Email[];
-  searchQuery: string;
-  otpOnly: boolean;
-  onSearchChange: (value: string) => void;
-  onSortChange: (value: string) => void;
-  onOtpOnlyChange: (checked: boolean) => void;
-  onSelectProvider: (provider: string) => void;
-  onCloseDropdown: () => void;
-  onCloseDomainMenu: () => void;
-}
-
-export interface FilterListProps {
-  searchQuery: string;
-  sortBy: string;
-  otpOnly: boolean;
-  onSearchChange: (value: string) => void;
-  onSortChange: (value: string) => void;
-  onOtpOnlyChange: (checked: boolean) => void;
-}
-
-export interface ArchivedEmailsProps {
-  onBack: () => void;
-  archivedSearch: string;
-  filteredArchivedEmails: Email[];
-  onSearchChange: (value: string) => void;
-  onRestore: (email: Email) => void;
-  onDelete: (email: Email) => void;
-  onClearSearch: () => void;
-}
-
-export interface EmailDetailProps {
-  onBack: () => void;
-  currentEmailDetail: Account | null;
-  emails: Email[];
-  loading: boolean;
-  onOpenMessageDetail: (thread: Email[]) => void;
-  onRefreshMessages: () => void;
-  onExportEmail: () => void;
-}
-
-export interface MessageDetailProps {
-  onBack: () => void;
-  selectedThread: Email[];
-}
-
-export interface LoginInfoProps {
-  onBack: () => void;
-  savedLogins: SavedLogin[];
-  onDelete: (id: string) => void;
-}
-
-export interface SettingsProps {
-  onBack: () => void;
-  useCustomPassword: boolean;
-  customPassword: string;
-  useCustomName: boolean;
-  customFirstName: string;
-  customLastName: string;
-  autoCopy: boolean;
-  autoRenew: boolean;
-  selectedProvider: string;
-  savingSettings: boolean;
-  loading: boolean;
-  onSaveSettings: () => void;
-  onHardReset: () => void;
-  providerInstances: ProviderInstance[];
-  selectedInstance: string | null;
-  onSetInstance: (instanceId: string) => void;
-  onExportData: () => void;
-  onImportData: () => void;
-  onProviderChange: (provider: string) => void;
-  onAddCustomInstance: (name: string, url: string) => void;
-  onLoadInstances: () => void;
-}
-
-export interface AnalyticsProps {
-  onBack: () => void;
-  analytics: Analytics;
-  loading: boolean;
-  onLoadAnalytics: () => void;
 }
 
 // ---- Export / Import ----
@@ -453,10 +393,31 @@ export interface CredentialsHistoryItem {
   phone?: string | null;
   website?: string | null;
   password?: string;
+  totpSecret?: string | null;
+  totp?: string | null;
+  otp?: string | null;
   inboxId?: string;
   identityId?: string;
   /** Privacy / terms / policy URLs captured from the signup form */
   policyUrls?: string[];
+  /**
+   * Which form fields were actually filled during autofill
+   * (e.g. email, password, firstName, phone, country).
+   */
+  filledFields?: string[];
+  /** Set when post-submit success was detected for this site */
+  verified?: boolean;
+  verifiedAt?: number;
+  /**
+   * Signup outcome tracking (do not treat autofill alone as success):
+   * pending_submit → user/auto has not submitted yet
+   * submitted → continue/signup clicked
+   * verified → success page/toast after submit
+   * undetected → could not confirm signup
+   * failed → site showed failure after submit
+   */
+  signupStatus?: 'pending_submit' | 'submitted' | 'verified' | 'undetected' | 'failed';
+  submittedAt?: number;
   [key: string]: unknown;
 }
 
@@ -508,12 +469,21 @@ export type BackgroundMessage =
   | { type: 'restoreInbox'; inboxId: string }
   | { type: 'getInboxes' }
   | { type: 'setProvider'; provider: MailProvider }
-  | { type: 'updateInboxTag'; inboxId: string; tag: string; color?: string | null }
+  | {
+      type: 'updateInboxTag';
+      inboxId: string;
+      tag: string;
+      color?: string | null;
+      /** Full multi-tag replacement list (takes precedence over single tag). */
+      tags?: Array<{ name: string; color: string }>;
+    }
   | { type: 'archiveInbox'; inboxId: string }
   | { type: 'unarchiveInbox'; inboxId: string }
   | { type: 'getProvider' }
   | { type: 'clearSessionCredentials' }
   | { type: 'updateSessionCredentials'; credentials: Partial<SessionCredentials> }
+  | { type: 'saveLoginCredential'; credential: Partial<CredentialsHistoryItem> }
+  | { type: 'openExtensionUi'; reason?: string; hint?: string; identityId?: string }
   | { type: 'getAnalytics' }
   | { type: 'resetAnalytics' }
   | { type: 'recordExtensionOpen' }
@@ -528,6 +498,12 @@ export type BackgroundMessage =
   | { action: 'getSelectedInstance' }
   | { action: 'setSelectedInstance'; instanceId: string }
   | { action: 'setInstance'; instanceId: string }
+  | {
+      type: 'setDisabledInstances';
+      provider: string;
+      /** Disabled-instance blacklist (all instances enabled when empty). */
+      disabledInstances: string[];
+    }
   | { action: 'removeCustomProviderInstance'; instanceId: string }
   | { action: 'getSelectedProviderInstance' }
   | { action: 'setSelectedProviderInstance'; instanceId: string }
@@ -548,7 +524,47 @@ export type BackgroundMessage =
       archivedRetentionDays?: number;
     }
   | { action: 'findReusableIdentity'; domain: string; inboxId?: string }
-  | { action: 'findSiteReplay'; domain: string; inboxId?: string };
+  | { action: 'findSiteReplay'; domain: string; inboxId?: string }
+  | { type: 'recordUIRenderTime'; renderTime: number }
+  | { type: 'encryptData'; text: string }
+  | { type: 'decryptData'; text: string }
+  | { type: 'generateIdentityField'; fieldType: string; locale?: string }
+  | { type: 'copyToClipboard'; text: string; purgeAfterMs?: number }
+  | { type: 'translate'; key: string; vars?: Record<string, unknown> }
+  | { type: 'getProviderDisplayName'; provider: string }
+  | { type: 'generateLocaleExtras'; locale?: string }
+  | { type: 'generateLocaleAwarePhone'; locale?: string }
+  | { type: 'getIconSvg'; name: string; size?: number; color?: string }
+  | { type: 'recordAutofillSuccess'; domain: string }
+  | { type: 'recordAutofillFailure'; domain: string }
+  | { type: 'loadSmartAutofillSettings' }
+  | {
+      type: 'routeIdentityForDomain';
+      domain: string;
+      identities?: Identity[];
+      selectedIdentityId?: string;
+    }
+  | {
+      type: 'recordAutofillOutcome';
+      opts: {
+        domain: string;
+        success: boolean;
+        identityId?: string | null;
+        inboxId?: string | null;
+        email?: string | null;
+        formScore?: unknown;
+        policyUrls?: string[];
+        usedReplay?: boolean;
+      };
+    }
+  | { type: 'shouldPreferReplay'; domain: string }
+  | { type: 'pickFreshestIdentity'; opts: unknown }
+  | { type: 'getActiveInboxMeta' }
+  | { type: 'markLatestCredentialVerified'; domain: string }
+  | { type: 'matchKindFromText'; text: string }
+  | { type: 'getStorageViaBg'; keys: string | string[] }
+  | { type: 'setStorageViaBg'; items: Record<string, unknown> }
+  | { type: 'classifyFieldFast'; text: string };
 
 // ---- Content script message shapes ----
 

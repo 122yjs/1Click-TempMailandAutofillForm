@@ -288,21 +288,25 @@ const EXPIRY_GROUP = buildKeywordAlternation(EXPIRY_LANGUAGE_BY_LANG);
 const YOUR_POSSESSIVES =
   '(?:your|this|the|votre|tu|dein|deine|ihr|euer|sein|ihre|ihr|tu|su|su|sus|uw|jouw|je|mon|ma|mes|son|sa|tuo|tua|il|la|lo|i|gli|le)';
 
+const ORDER_INVOICE_GUARD = '(?<!order\\s*#?|invoice\\s*#?|item\\s*#?|tracking\\s*#?|ticket\\s*#?)';
+
 const PATTERNS: readonly RegExp[] = [
-  // 1. Standalone 4-8 char token on its own line
-  /^\s*(?![a-zA-Z]{4,8}$)([a-zA-Z0-9]{4,8})\s*$/m,
+  // 1. Standalone 4-8 char token on its own line. Guarded against order/invoice
+  //    /tracking/ticket numbers so "Order #12345678" on its own line doesn't win
+  //    over a keyword-anchored OTP elsewhere in the body.
+  new RegExp(`^\\s*(?![a-zA-Z]{4,8}$)${ORDER_INVOICE_GUARD}([a-zA-Z0-9]{4,8})\\s*$`, 'm'),
   // 2. Keyword : code
   new RegExp(
-    `(?:${KEYWORD_GROUP})[\\s\\S]{0,75}[:：]\\s*\\b(?![a-zA-Z]{3,8}\\b)([a-zA-Z0-9]{3,8})\\b`,
+    `(?:${KEYWORD_GROUP})[\\s\\S]{0,75}[:：]\\s*\\b(?![a-zA-Z]{3,8}\\b)${ORDER_INVOICE_GUARD}([a-zA-Z0-9]{3,8})\\b`,
     'iu'
   ),
   // 3. (possessive) + keyword + (is|below) + code
   new RegExp(
-    `(?:${YOUR_POSSESSIVES}\\s+)?(?:${KEYWORD_GROUP})\\s*(?:is|below|=|:|：)?\\s*\\b(?![a-zA-Z]{3,8}\\b)([a-zA-Z0-9]{3,8})\\b`,
+    `(?:${YOUR_POSSESSIVES}\\s+)?(?:${KEYWORD_GROUP})\\s*(?:is|below|=|:|：)?\\s*\\b(?![a-zA-Z]{3,8}\\b)${ORDER_INVOICE_GUARD}([a-zA-Z0-9]{3,8})\\b`,
     'iu'
   ),
   // 4. Keyword ... 3-8 digit code (proximity)
-  new RegExp(`(?:${KEYWORD_GROUP})[\\s\\S]{0,50}\\b(\\d{3,8})\\b`, 'iu'),
+  new RegExp(`(?:${KEYWORD_GROUP})[\\s\\S]{0,50}\\b${ORDER_INVOICE_GUARD}(\\d{3,8})\\b`, 'iu'),
 ];
 
 // Subject-only: first 3-8 char alphanumeric token (last-resort permissive)

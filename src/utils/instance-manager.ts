@@ -6,10 +6,16 @@
 import { browser } from 'wxt/browser';
 import { DEFAULT_PROVIDER, loadProviderConfig } from '@/utils/email-service.js';
 import { ProviderInstanceNotFoundError } from '@/utils/errors.js';
-import { logError, logWarn } from '@/utils/logger.js';
+import { logError } from '@/utils/logger.js';
 import { withLock } from '@/utils/mutex.js';
 import { randomItem, randomToken } from '@/utils/secure-random.js';
-import { getStorage, type ProviderStorageKey, setStorage } from '@/utils/storage-keys.js';
+import {
+  disabledInstancesKey,
+  getStorage,
+  type ProviderStorageKey,
+  selectedInstanceKey,
+  setStorage,
+} from '@/utils/storage-keys.js';
 import type { ProviderInstance } from '@/utils/types.js';
 
 /**
@@ -45,51 +51,88 @@ export async function getProviderInstancesWithCustom(
 }
 
 /**
- * Get selected instance for a provider
+ * Disabled (blacklist) instance ids for a provider. When absent/empty, ALL
+ * instances are enabled. Migrates the legacy single-pin
+ * `selectedInstance_<provider>` key (kept for backwards compatibility):
+ *   • 'random' / missing → all enabled (empty blacklist)
+ *   • a concrete id     → blacklist everything except that id (preserves the
+ *                         user's current pin intent as "only this instance")
+ */
+export async function getDisabledInstances(providerId: string): Promise<string[]> {
+  const key = disabledInstancesKey(providerId);
+  const result = await getStorage<string[]>(key);
+  const stored = result && typeof result === 'object' ? result[key] : undefined;
+  if (Array.isArray(stored)) return stored;
+
+  // No blacklist yet — migrate the legacy single-pin selection if present.
+  const legacyKey = selectedInstanceKey(providerId);
+  const legacyResult = await getStorage<string>(legacyKey);
+  const legacy =
+    legacyResult && typeof legacyResult === 'object' ? legacyResult[legacyKey] : undefined;
+
+  if (typeof legacy === 'string' && legacy !== 'random') {
+    const instances = await getProviderInstancesWithCustom(providerId);
+    const blacklist = instances.map((i) => i.id).filter((id) => id !== legacy);
+    await setStorage(key, blacklist);
+    // Retire the legacy single-pin key so it can never re-assert a stale pin
+    // (e.g. a pinned instance the user later disabled via the new checkboxes).
+    await browser.storage.local.remove(legacyKey).catch(() => {});
+    return blacklist;
+  }
+
+  await setStorage(key, []);
+  await browser.storage.local.remove(legacyKey).catch(() => {});
+  return [];
+}
+
+/**
+ * Persist the disabled-instance blacklist for a provider.
+ */
+export async function setDisabledInstances(providerId: string, disabled: string[]): Promise<void> {
+  await setStorage(disabledInstancesKey(providerId), Array.from(new Set(disabled)));
+}
+
+/**
+ * Instances eligible for email generation for a provider (all minus blacklist).
+ * Returns [] when the provider has no instances at all.
+ */
+export async function getEnabledInstances(providerId: string): Promise<ProviderInstance[]> {
+  const instances = await getProviderInstancesWithCustom(providerId);
+  if (instances.length === 0) return [];
+  const disabled = new Set(await getDisabledInstances(providerId));
+  return instances.filter((i) => !disabled.has(i.id));
+}
+
+/**
+ * Get the random pick among the provider's ENABLED instances (null when none).
+ * Kept for backwards compatibility — the pool semantics now drive creation.
  */
 export async function getSelectedProviderInstance(
   providerId: string
 ): Promise<ProviderInstance | null> {
-  const storageKey: ProviderStorageKey = `selectedInstance_${providerId}`;
-  const result = await getStorage<string>(storageKey);
-  const selectedInstance = result && typeof result === 'object' ? result[storageKey] : undefined;
-
-  const instances = await getProviderInstancesWithCustom(providerId);
-
-  if (!selectedInstance || typeof selectedInstance !== 'string') {
-    await setStorage(storageKey, 'random');
-    const randomInstance = randomItem(instances);
-    return randomInstance || null;
-  }
-
-  if (selectedInstance === 'random') {
-    const randomInstance = randomItem(instances);
-    return randomInstance || null;
-  }
-
-  const selected = instances.find((instance) => instance.id === selectedInstance);
-  if (!selected) {
-    logWarn(
-      `Selected instance ${selectedInstance} not found for provider ${providerId}, falling back to random`
-    );
-    await setStorage(storageKey, 'random');
-    const randomInstance = randomItem(instances);
-    return randomInstance || null;
-  }
-  return selected;
+  const enabled = await getEnabledInstances(providerId);
+  return enabled.length > 0 ? (randomItem(enabled) ?? null) : null;
 }
 
 /**
- * Set selected instance for a provider
+ * Set selected instance for a provider (legacy single-pin API).
+ * Backed by the blacklist: pinning an id disables all others;
+ * 'random' clears the blacklist (all enabled).
  */
 export async function setProviderInstance(providerId: string, instanceId: string): Promise<void> {
+  if (instanceId === 'random') {
+    await setDisabledInstances(providerId, []);
+    return;
+  }
   const instances = await getProviderInstancesWithCustom(providerId);
   const instance = instances.find((i) => i.id === instanceId);
   if (!instance) {
     throw new ProviderInstanceNotFoundError(instanceId);
   }
-  const storageKey: ProviderStorageKey = `selectedInstance_${providerId}`;
-  await setStorage(storageKey, instanceId);
+  await setDisabledInstances(
+    providerId,
+    instances.map((i) => i.id).filter((id) => id !== instanceId)
+  );
 }
 
 /**
@@ -103,8 +146,19 @@ export async function addCustomProviderInstance(
     const storageKey: ProviderStorageKey = `customInstances_${providerId}`;
     const result = await getStorage<ProviderInstance[]>(storageKey);
     const customInstances: ProviderInstance[] = result[storageKey] || [];
+    // Strip query strings from apiUrl to prevent leaking tokens in stored instance URLs
+    let sanitizedApiUrl = instance.apiUrl;
+    try {
+      const u = new URL(instance.apiUrl);
+      u.search = '';
+      u.hash = '';
+      sanitizedApiUrl = u.toString().replace(/\/$/, '');
+    } catch {
+      /* invalid URL — keep as-is for validation to catch */
+    }
     const newInstance: ProviderInstance = {
       ...instance,
+      apiUrl: sanitizedApiUrl,
       id: `custom_${providerId}_${Date.now()}_${randomToken(6)}`,
       isCustom: true,
     };

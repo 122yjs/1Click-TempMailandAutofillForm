@@ -46,6 +46,8 @@ export const SETTINGS_SYNC_KEYS = [
 ];
 
 export const THEME_SYNC_KEYS = ['themeMode', 'contrastLevel'];
+/** Toast master switch — synced via its own handler (no full settings reload). */
+export const TOAST_SYNC_KEYS = ['toastsEnabled'];
 export const INBOX_SYNC_KEYS = ['inboxes', 'activeInboxId', 'demoMode', 'storedEmails'];
 export const IDENTITY_SYNC_KEYS = ['identities', 'selectedIdentityId'];
 export const FILTER_SYNC_KEYS = ['savedSearchFilters'];

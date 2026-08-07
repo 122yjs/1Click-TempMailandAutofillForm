@@ -61,3 +61,24 @@ export function isInteractiveTarget(target: EventTarget | null): boolean {
     'button, a, input, textarea, select, [role="button"], [role="menuitem"], [data-no-marquee]'
   );
 }
+
+/** User preference for rubber-band (marquee) multi-select. */
+import { browser } from 'wxt/browser';
+
+export const MARQUEE_SELECTION_KEY = 'marqueeSelectionEnabled';
+
+export async function isMarqueeSelectionEnabled(): Promise<boolean> {
+  try {
+    const res = (await browser.storage.local.get([MARQUEE_SELECTION_KEY])) as {
+      marqueeSelectionEnabled?: boolean;
+    };
+    return res.marqueeSelectionEnabled !== false;
+  } catch {
+    /* ignore */
+    return true;
+  }
+}
+
+export async function setMarqueeSelectionEnabled(enabled: boolean): Promise<void> {
+  await browser.storage.local.set({ [MARQUEE_SELECTION_KEY]: enabled });
+}

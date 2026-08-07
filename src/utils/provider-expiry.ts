@@ -22,7 +22,8 @@ function parseAbsoluteTimestampMs(value: unknown): number | null {
 export function deriveInboxTiming(
   result: Record<string, unknown>,
   config: ProviderConfig,
-  fallbackNow = Date.now()
+  fallbackNow = Date.now(),
+  opts?: { renewalBaseNow?: boolean }
 ): { createdAt: number; expiresAt: number } {
   const fields = config.expiry?.fields || {};
   const createdAtKey = fields.createdAt || 'created_at';
@@ -35,7 +36,18 @@ export function deriveInboxTiming(
     parseAbsoluteTimestampMs(result.created_at) ??
     parseAbsoluteTimestampMs(result.timestamp);
 
-  const createdAt = rawCreatedAt && rawCreatedAt > 0 ? rawCreatedAt : fallbackNow;
+  // BUG FIX (auto-renew): For renewal, do NOT trust a possibly-stale
+  // `result.timestamp` from the API as the created-at base. If the provider
+  // returns the ORIGINAL session timestamp (not the renewal time), the derived
+  // expiresAt would be `original_createdAt + duration` — already in the past,
+  // causing auto-renew to fail/loop. When `renewalBaseNow` is true, force the
+  // base to `fallbackNow` (Date.now()) so the renewed window is always in the
+  // future, unless the API provides an absolute future expiry/ttl.
+  const createdAt = opts?.renewalBaseNow
+    ? fallbackNow
+    : rawCreatedAt && rawCreatedAt > 0
+      ? rawCreatedAt
+      : fallbackNow;
 
   const absoluteExpiresAt =
     parseAbsoluteTimestampMs(result[expiresAtKey]) ??
@@ -68,4 +80,23 @@ export function deriveInboxTiming(
   }
 
   return { createdAt, expiresAt };
+}
+
+/**
+ * Adaptive pre-expiry window for auto-renew.
+ *
+ * Uses the measured renewal latency (from the account record) to ensure the
+ * auto-renew fires early enough to complete before the mailbox expires.
+ * Falls back to a provider-configured minimum window when no latency has been
+ * measured yet (e.g. a brand-new inbox).
+ *
+ *   window = max(minPreExpiryWindowMs, measuredLatencyMs × (1 + safetyBufferRatio))
+ */
+export function computePreExpiryWindow(config: ProviderConfig, measuredLatencyMs?: number): number {
+  const minWindow = config.expiry?.renewal?.minPreExpiryWindowMs ?? 300000; // 5 min default
+  const bufferRatio = config.expiry?.renewal?.safetyBufferRatio ?? 0.25; // 25% default
+  if (typeof measuredLatencyMs === 'number' && measuredLatencyMs > 0) {
+    return Math.max(minWindow, Math.round(measuredLatencyMs * (1 + bufferRatio)));
+  }
+  return minWindow;
 }

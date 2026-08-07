@@ -1,0 +1,48 @@
+/**
+ * Default domain-specific identity field overrides.
+ *
+ * Keys are domain patterns (exact match or suffix match with dot prefix).
+ * Values are partial Identity field overrides — they take precedence over
+ * the selected identity's default values when autofilling on that domain.
+ *
+ * Example: LinkedIn requires a real name (not random) and a username.
+ * The override below ensures the real identity's name is used on linkedin.com
+ * rather than a randomly generated one.
+ */
+{
+  "linkedin.com": {
+    "firstNames": "__use_identity_firstNames__",
+    "lastNames": "__use_identity_lastNames__"
+  },
+  "github.com": {
+    "username": "__use_identity_username__",
+    "firstNames": "__use_identity_firstNames__",
+    "lastNames": "__use_identity_lastNames__"
+  },
+  "stackoverflow.com": {
+    "username": "__use_identity_username__",
+    "firstNames": "__use_identity_firstNames__",
+    "lastNames": "__use_identity_lastNames__"
+  },
+  "stackoverflow.co.uk": {
+    "username": "__use_identity_username__",
+    "firstNames": "__use_identity_firstNames__",
+    "lastNames": "__use_identity_lastNames__"
+  },
+  "medium.com": {
+    "firstNames": "__use_identity_firstNames__",
+    "lastNames": "__use_identity_lastNames__"
+  },
+  "twitter.com": {
+    "username": "__use_identity_username__"
+  },
+  "x.com": {
+    "username": "__use_identity_username__"
+  },
+  "reddit.com": {
+    "username": "__use_identity_username__"
+  },
+  "notion.so": {
+    "email": "__use_identity_preferredEmail__"
+  }
+}

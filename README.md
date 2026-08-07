@@ -7,10 +7,11 @@ Generate temporary email addresses and auto-fill OTPs and login forms with one c
 - **Temporary Email Generation**: Create disposable email addresses instantly
 - **OTP Auto-Detection**: Automatically detects and extracts OTP codes from emails
 - **Form Auto-Fill**: One-click OTP and email form filling
-- **Multiple Browser Support**: Works on Chrome and Firefox
+- **Multiple Browser Support**: Chrome (published), Firefox & Safari builds (export-ready; store listings coming soon)
 - **Identity Management**: Manage multiple identities with custom names
 - **Inbox Management**: View and manage emails across multiple inboxes
 - **Tag System**: Organize inboxes with custom tags and colors
+- **Demo signup pages**: Built-in showcase forms for practicing Autofill in demo mode
 
 ## Permissions
 
@@ -62,20 +63,47 @@ Narrowing the permission would require either removing the universal-autofill fe
 - Firefox: [host_permissions in Manifest V3](https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/manifest.json/host_permissions)
 - Source: `wxt.config.ts:82-91` (manifest declaration), `src/entrypoints/content/index.ts:12-14` (content script)
 
-## Installation
+## Install from stores
+
+| Browser | Status | Link |
+|---------|--------|------|
+| **Chrome** | Published | [Chrome Web Store](https://chromewebstore.google.com/detail/1click-temp-mail-with-aut/oilafkncmnboohnekbnokkifjbnjeecn) |
+| **Firefox** | Coming soon | [Firefox Add-ons (ghost listing)](https://addons.mozilla.org/firefox/addon/1click-temp-mail/) |
+| **Safari** | Coming soon | [App Store (ghost listing)](https://apps.apple.com/app/1click-temp-mail) |
+| **Edge** | Coming soon | Ghost listing placeholder |
+
+## Installation (developer / sideload)
 
 ### Chrome
-1. Download the latest release from the [Releases](https://github.com/yourusername/1click-temp-mail-autofill-form/releases) page
+1. Download the latest release from the [Releases](https://github.com/UnarchiveTech/1Click-TempMailandAutofillForm/releases) page
 2. Extract the downloaded zip file
 3. Open Chrome and navigate to `chrome://extensions/`
 4. Enable "Developer mode" in the top right
 5. Click "Load unpacked" and select the extracted folder
 
 ### Firefox
-1. Download the latest Firefox release from the [Releases](https://github.com/yourusername/1click-temp-mail-autofill-form/releases) page
+1. Download the latest Firefox release from the [Releases](https://github.com/UnarchiveTech/1Click-TempMailandAutofillForm/releases) page
 2. Extract the downloaded zip file
 3. Open Firefox and navigate to `about:debugging#/runtime/this-firefox`
 4. Click "Load Temporary Add-on" and select the `manifest.json` file in the extracted folder
+
+### Safari (export-ready)
+
+The project builds a Safari-compatible MV3 package via WXT. Store submission is not live yet (ghost link above).
+
+```bash
+# Produce Safari build artifacts
+bun run build:safari
+# Optional zip
+bun run zip:safari
+```
+
+1. Run `bun run build:safari` (or `zip:safari`).
+2. Open the output under `.output/safari-mv3` (exact folder name may vary by WXT version).
+3. On macOS, convert / load with **Xcode → File → New → Project → Safari Extension App**, or use Apple’s `safari-web-extension-converter` against the built folder.
+4. Enable the extension in Safari → Settings → Extensions.
+
+Firefox and Safari store links above are **ghost placeholders** until listings go live; Chrome uses the real Web Store URL.
 
 ## Development
 
@@ -109,9 +137,13 @@ bun run build
 # Build for Firefox
 bun run build:firefox
 
+# Build for Safari (MV3 export; convert with Xcode / safari-web-extension-converter)
+bun run build:safari
+
 # Create zip package
 bun run zip
 bun run zip:firefox
+bun run zip:safari
 ```
 
 ### Linting and Type Checking
@@ -148,6 +180,18 @@ Contributions are welcome! Please read our [CONTRIBUTING.md](CONTRIBUTING.md) fo
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Third-Party Attributions
+
+### Material Color Utilities
+
+This project includes a lightweight, vendored port of Google's [`@material/material-color-utilities`](https://github.com/material-components/material-color-utilities) (Apache 2.0 License). The original library is 102 KB; the vendored version in `src/utils/material-color-utils.ts` is ~6 KB and implements the Material 3 `SchemeTonalSpot` color algorithm used for dynamic theme generation (`src/utils/theme-generator.ts`).
+
+- **Original library**: https://github.com/material-components/material-color-utilities
+- **License**: Apache License, Version 2.0
+- **Source file**: `src/utils/material-color-utils.ts`
+- **Usage**: `import { Hct, SchemeTonalSpot, MaterialDynamicColors } from '@/utils/material-color-utils.js'` in `src/utils/theme-generator.ts`
+- **Build-time tool**: `scripts/generate-theme.ts` still imports the full `@material/material-color-utilities` package (listed as a devDependency) for CLI theme generation, which is not shipped to the browser.
 
 ## Support
 

@@ -258,6 +258,54 @@ export async function enterDemoMode(ext: Browser): Promise<void> {
       : null,
     demoReceiveIndex: 0,
   });
+
+  // Open in-extension signup showcase pages so Autofill can be demonstrated
+  try {
+    await openDemoSignupShowcase(ext);
+    setTimeout(() => {
+      void simulateDemoReceive(ext);
+    }, 2000);
+  } catch {
+    /* non-fatal — demo data still loaded */
+  }
+}
+
+/** Bundled signup HTML pages for Autofill demos. */
+export const DEMO_SIGNUP_PAGES = [
+  'signup-social.html',
+  'signup-newsletter.html',
+  'signup-checkout.html',
+] as const;
+
+export const PROD_DEMO_BASE_URL = 'https://demo.1click.mail';
+export const DEV_DEMO_BASE_URL = 'http://localhost:5173/demo';
+
+/** Dynamically resolves demo page URL based on environment (localhost in dev/test, HTTPS domain in prod). */
+export function getDemoPageUrl(page: string, _ext?: Browser): string {
+  const isDev = process.env.NODE_ENV !== 'production';
+  const cleanPage = page.replace(/^demo\//, '');
+  if (isDev) {
+    return `${DEV_DEMO_BASE_URL}/${cleanPage}`;
+  }
+  return `${PROD_DEMO_BASE_URL}/${cleanPage}`;
+}
+
+/** Open 2–3 signup demo pages in new tabs (used by demo mode). */
+export async function openDemoSignupShowcase(ext: Browser): Promise<void> {
+  const tabsApi = (
+    ext as unknown as {
+      tabs?: { create?: (o: { url: string; active?: boolean }) => Promise<unknown> };
+    }
+  ).tabs;
+  if (!tabsApi?.create) return;
+
+  for (let i = 0; i < DEMO_SIGNUP_PAGES.length; i++) {
+    const page = DEMO_SIGNUP_PAGES[i];
+    if (!page) continue;
+    const url = getDemoPageUrl(page, ext);
+    // First page focused; others in background
+    await tabsApi.create({ url, active: i === 0 });
+  }
 }
 
 /** Exit demo: restore real snapshot if present. */

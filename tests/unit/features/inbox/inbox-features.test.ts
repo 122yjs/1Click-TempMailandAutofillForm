@@ -95,7 +95,8 @@ describe('canUnarchive', () => {
       address: 'test@guerrilla.com',
       provider: 'guerrilla',
       createdAt: Date.now(),
-      expiresAt: Date.now() + 3600000,
+      expiresAt: Date.now() + 3_600_000,
+      accountStatus: 'archived',
       status: 'archived',
     };
     expect(canUnarchive(account)).toBe(true);
@@ -107,7 +108,9 @@ describe('canUnarchive', () => {
       address: 'test@burner.kiwi',
       provider: 'burner',
       createdAt: Date.now(),
-      expiresAt: Date.now() + 3600000,
+      // Far future so the assertion is not clock-sensitive
+      expiresAt: Date.now() + 86_400_000,
+      accountStatus: 'archived',
       status: 'archived',
     };
     expect(canUnarchive(account)).toBe(true);
@@ -118,9 +121,22 @@ describe('canUnarchive', () => {
       id: '1',
       address: 'test@burner.kiwi',
       provider: 'burner',
-      createdAt: Date.now() - 100000,
+      createdAt: Date.now() - 100_000,
       expiresAt: Date.now() - 1000,
+      accountStatus: 'archived',
       status: 'expired',
+    };
+    expect(canUnarchive(account)).toBe(false);
+  });
+
+  test('returns false for unknown provider without throwing', () => {
+    const account: Account = {
+      id: '1',
+      address: 'x@example.com',
+      provider: 'not-a-real-provider' as Account['provider'],
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 3_600_000,
+      accountStatus: 'archived',
     };
     expect(canUnarchive(account)).toBe(false);
   });

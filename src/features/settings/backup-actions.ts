@@ -43,6 +43,7 @@ export const BACKUP_CATEGORY_KEYS: Record<BackupCategory, readonly string[]> = {
     'emailRetentionDays',
     'faviconCaching',
     'providerInstances',
+    'toastsEnabled',
   ],
   identities: ['identities', 'selectedIdentityId'],
   savedLogins: ['loginInfo', 'emailHistory'],
@@ -62,6 +63,7 @@ const SETTINGS_IMPORT_KEYS = [
   'emailRetentionDays',
   'faviconCaching',
   'providerInstances',
+  'toastsEnabled',
 ] as const;
 
 export interface BackupSelection {
@@ -154,6 +156,7 @@ export function isProviderRenewable(provider: string): boolean {
   try {
     return loadProviderConfig(provider).expiry?.renewable ?? false;
   } catch {
+    /* ignore */
     return false;
   }
 }
@@ -425,6 +428,7 @@ export async function decryptBackupPayload(
     }
     return parsed;
   } catch {
+    /* ignore */
     throw new Error('Incorrect password or corrupted backup file');
   }
 }
@@ -467,31 +471,49 @@ export function downloadJson(obj: unknown, filename: string): void {
   const json = JSON.stringify(obj, null, 2);
   const blob = new Blob([json], { type: 'application/json;charset=utf-8' });
   const url = URL.createObjectURL(blob);
+
+  const triggerDomDownload = () => {
+    try {
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch {
+      /* ignore */
+    }
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  };
+
   // Prefer extension downloads API (survives popup close better than <a download>)
   try {
-    const b = (globalThis as { browser?: { downloads?: { download: (o: unknown) => void } } })
-      .browser;
+    const b = (
+      globalThis as {
+        browser?: { downloads?: { download: (o: unknown) => Promise<unknown> } };
+      }
+    ).browser;
     if (b?.downloads?.download) {
-      void b.downloads.download({
-        url,
-        filename,
-        saveAs: true,
-      });
-      // Revoke later so the download can start
-      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      Promise.resolve(
+        b.downloads.download({
+          url,
+          filename,
+          saveAs: true,
+        })
+      )
+        .then(() => {
+          setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        })
+        .catch(() => {
+          triggerDomDownload();
+        });
       return;
     }
   } catch {
     /* fall through */
   }
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.rel = 'noopener';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  triggerDomDownload();
 }
 
 export function downloadBackup(
@@ -550,6 +572,7 @@ export async function getLastBackupExportAt(ext: {
     const n = res[LAST_BACKUP_AT_KEY];
     return typeof n === 'number' && n > 0 ? n : null;
   } catch {
+    /* ignore */
     return null;
   }
 }
@@ -600,6 +623,7 @@ function looksLikeImportableData(obj: Record<string, unknown>): boolean {
     obj.themeMode != null ||
     obj.autoCopy != null ||
     obj.autoRenew != null ||
+    obj.toastsEnabled != null ||
     obj.analytics != null
   );
 }
@@ -631,9 +655,10 @@ export async function parseBackupText(text: string): Promise<ParseBackupResult> 
       const cleaned = trimmed
         .replace(/\/\*[\s\S]*?\*\//g, '')
         .replace(/^\s*\/\/.*$/gm, '')
-        .replace(/,\s*([}\]])/g, '$1');
+        .replace(/"(?:[^"\\]|\\.)*"|,\s*(?=[}\]])/g, (m) => (m.startsWith('"') ? m : ''));
       parsed = JSON.parse(cleaned);
     } catch {
+      /* ignore */
       throw new Error('Invalid JSON format');
     }
   }

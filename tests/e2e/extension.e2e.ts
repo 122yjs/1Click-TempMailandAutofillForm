@@ -125,6 +125,28 @@ test.describe('Email list and viewer interactions', () => {
   });
 });
 
+test.describe('Label tabs and filtering', () => {
+  test('labeling a message updates custom tab count and filter', async ({ extensionPage }) => {
+    const LABEL = 'e2e-priority';
+
+    await extensionPage.locator('text=Your verification code').click();
+    await extensionPage.getByRole('button', { name: 'Add a label' }).click();
+    await extensionPage.getByPlaceholder('e.g. Banking, Shopping').fill(LABEL);
+    await extensionPage.getByRole('button', { name: 'Save' }).click();
+
+    await extensionPage.getByRole('button', { name: 'Back' }).click();
+
+    const labelTab = extensionPage.getByRole('button', {
+      name: new RegExp(`${LABEL} \\(1\\)`),
+    });
+    await expect(labelTab).toBeVisible({ timeout: 8000 });
+
+    await labelTab.click();
+    await expect(extensionPage.locator('text=Your verification code')).toBeVisible();
+    await expect(extensionPage.locator('text=GitHub').first()).toBeVisible();
+  });
+});
+
 // ── 6. EMAIL CREATION & SIMULATION ───────────────────────────────────────────
 
 test.describe('Address management and incoming simulation', () => {
@@ -357,5 +379,16 @@ test.describe('OTP input detection (mock fixture)', () => {
     for (let i = 0; i < 6; i++) {
       await expect(inputs.nth(i)).toHaveValue(String(i + 1));
     }
+  });
+});
+
+test.describe('Real Web Domain Demo Page Integration', () => {
+  test('serves demo signup checkout page on localhost web origin', async ({ context }) => {
+    const page = await context.newPage();
+    await page.goto('http://localhost:5173/demo/signup-checkout.html');
+    await expect(page).toHaveTitle(/Checkout|Registration|Sign/i);
+    const emailInput = page.locator('input[type="email"]');
+    await expect(emailInput).toBeVisible();
+    await page.close();
   });
 });

@@ -58,6 +58,7 @@ export function providerSupportsRenew(providerId: string | null | undefined): bo
     const cfg = loadProviderConfig(providerId);
     return !!cfg.expiry?.renewable;
   } catch {
+    /* ignore */
     return providerId === 'demo';
   }
 }

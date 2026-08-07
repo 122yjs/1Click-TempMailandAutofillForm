@@ -61,6 +61,21 @@ export function sanitizeColor(color: string): string | null {
 }
 
 /**
+ * Authoritative domain normalization function for credential matching and intelligence lookups.
+ * Strips protocol, ports, paths, query params, www. prefix, trims, and converts to lowercase.
+ */
+export function normalizeDomain(d: string): string {
+  let s = (d || '').trim().toLowerCase();
+  s = s.replace(/^https?:\/\//i, '');
+  const slash = s.indexOf('/');
+  if (slash !== -1) s = s.slice(0, slash);
+  const query = s.indexOf('?');
+  if (query !== -1) s = s.slice(0, query);
+  s = s.replace(/:\d+$/, '');
+  return s.replace(/^www\./i, '');
+}
+
+/**
  * Validate and sanitize email address
  */
 export function validateEmail(email: string): boolean {

@@ -2,17 +2,15 @@
  * Autofill intelligence orchestrator — FormScore + identity route + replay decision.
  */
 
-import { browser } from 'wxt/browser';
 import type { ReusableCredential } from '@/features/login-info/login-crypto.js';
+import { routeIdentityForDomainViaBg, shouldPreferReplayViaBg } from '@/utils/content-bg-bridge.js';
 import type { Identity } from '@/utils/types.js';
+import { normalizeDomain } from '@/utils/validation.js';
 import { scoreForm } from './form-score.js';
-import { routeIdentityForDomain } from './identity-router.js';
-import { shouldPreferReplay } from './site-memory.js';
-import { normalizeDomain } from './storage.js';
-import type { AutofillPlan, FormScore } from './types.js';
+import type { AutofillPlan, FormScore, IdentityRouteResult } from './types.js';
 
 export async function buildAutofillPlan(
-  form: HTMLFormElement,
+  form: HTMLElement,
   opts?: {
     domain?: string;
     replayCredential?: ReusableCredential | null;
@@ -23,8 +21,15 @@ export async function buildAutofillPlan(
   const domain =
     normalizeDomain(opts?.domain || (typeof location !== 'undefined' ? location.hostname : '')) ||
     'unknown';
-  const formScore: FormScore = scoreForm(form, domain);
-  const route = await routeIdentityForDomain(domain, opts?.identities, opts?.selectedIdentityId);
+  const formScore: FormScore = await scoreForm(form, domain);
+  const routeResult = await routeIdentityForDomainViaBg(
+    domain,
+    opts?.identities,
+    opts?.selectedIdentityId
+  );
+  const route: IdentityRouteResult = routeResult
+    ? (routeResult as { identityId: string | null; reason: IdentityRouteResult['reason'] })
+    : { identityId: null, reason: 'none' };
 
   let replay = opts?.replayCredential ?? null;
   if (replay === undefined) {
@@ -32,7 +37,7 @@ export async function buildAutofillPlan(
     replay = null;
   }
 
-  const preferReplay = await shouldPreferReplay(domain);
+  const preferReplay = await shouldPreferReplayViaBg(domain);
   const useReplay = !!(replay && preferReplay);
 
   return {
@@ -43,51 +48,4 @@ export async function buildAutofillPlan(
     useReplay,
     mode: useReplay ? 'replay' : 'generate',
   };
-}
-
-/**
- * Resolve active inbox + domain for memory recording.
- */
-export async function getActiveInboxMeta(): Promise<{
-  inboxId: string | null;
-  address: string | null;
-  provider: string | null;
-  providerDisplay: string | null;
-}> {
-  try {
-    const { activeInboxId, inboxes = [] } = (await browser.storage.local.get([
-      'activeInboxId',
-      'inboxes',
-    ])) as {
-      activeInboxId?: string;
-      inboxes?: Array<{
-        id: string;
-        address: string;
-        provider?: string;
-        providerName?: string;
-      }>;
-    };
-    const inbox = inboxes.find((i) => i.id === activeInboxId) || inboxes[0];
-    if (!inbox) {
-      return { inboxId: null, address: null, provider: null, providerDisplay: null };
-    }
-    let providerDisplay = inbox.providerName || null;
-    if (!providerDisplay && inbox.provider) {
-      try {
-        const { loadProviderConfig } = await import('@/utils/email-service.js');
-        const cfg = loadProviderConfig(inbox.provider);
-        providerDisplay = cfg?.displayName || inbox.provider;
-      } catch {
-        providerDisplay = inbox.provider;
-      }
-    }
-    return {
-      inboxId: inbox.id || null,
-      address: inbox.address || null,
-      provider: inbox.provider || null,
-      providerDisplay,
-    };
-  } catch {
-    return { inboxId: null, address: null, provider: null, providerDisplay: null };
-  }
 }

@@ -1,7 +1,7 @@
 import type { Browser } from 'wxt/browser';
 import { t } from '@/utils/i18n-utils.js';
 import { logError } from '@/utils/logger.js';
-import { timeAgo } from '@/utils/time.js';
+import { timeAgo } from '@/utils/time-format.js';
 import type { Account, Email } from '@/utils/types.js';
 
 export interface ArchivedState {
@@ -16,7 +16,7 @@ export interface ArchivedSetters {
 
 export async function loadArchivedEmails(ext: Browser, setters: ArchivedSetters) {
   try {
-    const response = await ext.runtime.sendMessage({ action: 'getArchivedEmails' });
+    const response = await ext.runtime.sendMessage({ type: 'getArchivedEmails' });
     if (response?.success) {
       const archivedEmails = (response.archivedEmails || []).map((m: Email) => {
         const inbox = m.original_inbox || '';
@@ -37,6 +37,7 @@ export async function loadArchivedEmails(ext: Browser, setters: ArchivedSetters)
           otp: m.otp,
           body_html: m.body_html,
           body_plain: m.body_plain,
+          raw_source: m.raw_source,
           received_at: m.received_at,
           original_inbox: inbox,
         };

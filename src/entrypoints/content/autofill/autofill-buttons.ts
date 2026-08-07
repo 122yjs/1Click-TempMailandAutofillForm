@@ -2,11 +2,38 @@
  * Autofill button injection and removal.
  */
 
-import { browser } from 'wxt/browser';
+import { buildAutofillPlan } from '@/features/intelligence/autofill-plan.js';
+import {
+  createFreshInboxAddress,
+  watchEmailConflict,
+} from '@/features/intelligence/conflict-watch.js';
+import { showDryRunPreview } from '@/features/intelligence/dry-run.js';
+import { maybeHumanDelay } from '@/features/intelligence/fill-timing.js';
+import { armSignupOutcomeAfterSubmit } from '@/features/intelligence/submit-action.js';
+import { getFormUndoStack } from '@/features/intelligence/undo-stack.js';
 import type { ReusableCredential } from '@/features/login-info/login-crypto.js';
-import { BUTTON_OPACITY_DEFAULT, BUTTON_OPACITY_HOVER } from '@/utils/constants.js';
-import { t } from '@/utils/i18n-utils.js';
+import {
+  detectWizardStepFromPage,
+  generateIdentityViaBg,
+  getActiveInboxMetaViaBg,
+  getIconSvgViaBg,
+  getStorageViaBg,
+  loadSmartAutofillSettingsViaBg,
+  pickFreshestIdentityViaBg,
+  recordAutofillFailureViaBg,
+  recordAutofillOutcomeViaBg,
+  recordAutofillSuccessViaBg,
+  routeIdentityForDomainViaBg,
+  sendMessageViaBg,
+  setStorageViaBg,
+  upsertWizardSessionViaBg,
+} from '@/utils/content-bg-bridge.js';
+import { BUTTON_OPACITY_DEFAULT, BUTTON_OPACITY_HOVER } from '@/utils/content-constants.js';
+import { t } from '@/utils/content-i18n.js';
+import { trustedClick } from '@/utils/dom-guard.js';
+import { safeId, safeName, safePlaceholder } from '@/utils/dom-safe.js';
 import { logError, logWarn } from '@/utils/logger.js';
+import { CONTENT_Z } from '@/utils/portal-layers.js';
 import {
   positionAfterElement,
   positionAtEndOfField,
@@ -19,7 +46,14 @@ import {
   POPUP_CLASS,
 } from '../dom/shadow-dom.js';
 import { showConflictChip, showFillMicroStatus, showTooltip } from '../dom/tooltip.js';
-import { scoreSignupForm } from './form-detector.js';
+import { startMultiStepOtpWatch } from '../otp/multi-step-otp.js';
+import { showWaitOtpPanel } from '../otp/wait-otp-panel.js';
+import {
+  classifyFormIntent,
+  isSigninForm,
+  isSignupForm,
+  scoreSignupForm,
+} from './form-detector.js';
 import {
   type AutofillBlockReason,
   fillAllEmailFields,
@@ -31,21 +65,69 @@ import {
   getPasswordToFill,
   isEmailUsedInSavedLogins,
 } from './form-filler.js';
-import { generatePhoneNumber, generateUsername, generateWebsiteUrl } from './generators.js';
+
+type FieldSnapshot = {
+  el: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+  value: string;
+  checked?: boolean;
+};
+
+function snapshotFormFields(form: ParentNode): FieldSnapshot[] {
+  const out: FieldSnapshot[] = [];
+  try {
+    const fields = form.querySelectorAll<
+      HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement
+    >('input, select, textarea');
+    for (const el of Array.from(fields)) {
+      if ((el as HTMLInputElement).type === 'password') {
+        out.push({ el, value: (el as HTMLInputElement).value || '', checked: false });
+        continue;
+      }
+      if (
+        (el as HTMLInputElement).type === 'checkbox' ||
+        (el as HTMLInputElement).type === 'radio'
+      ) {
+        out.push({ el, value: '', checked: !!(el as HTMLInputElement).checked });
+        continue;
+      }
+      out.push({ el, value: el.value || '' });
+    }
+  } catch {
+    /* ignore */
+  }
+  return out;
+}
+
+function restoreFormFields(snap: FieldSnapshot[]): void {
+  for (const s of snap) {
+    try {
+      if (!s.el.isConnected) continue;
+      if (s.checked !== undefined && 'checked' in s.el) {
+        (s.el as HTMLInputElement).checked = !!s.checked;
+      } else {
+        s.el.value = s.value;
+      }
+      s.el.dispatchEvent(new Event('input', { bubbles: true }));
+      s.el.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch {
+      /* ignore */
+    }
+  }
+}
 
 /** Create a new inbox via background and fill email + confirm fields. */
 async function generateAndFillNewEmail(
-  form: HTMLFormElement | null,
+  form: HTMLElement | null,
   inputField: HTMLInputElement | HTMLSelectElement,
   updateAndCopyCredentials: (creds: Record<string, string>) => Promise<void>
 ): Promise<boolean> {
-  const { selectedProvider } = (await browser.storage.local.get('selectedProvider')) as {
+  const { selectedProvider } = (await getStorageViaBg('selectedProvider')) as {
     selectedProvider?: string;
   };
-  const provider = selectedProvider || 'guerrilla';
-  const result = (await browser.runtime.sendMessage({
+  const result = (await sendMessageViaBg({
     type: 'createInbox',
-    provider,
+    // No hardcoded provider: background resolves configured default when unset.
+    provider: selectedProvider,
   })) as {
     success?: boolean;
     address?: string;
@@ -67,16 +149,26 @@ async function generateAndFillNewEmail(
   return false;
 }
 
-/** Extension logo mark for in-field buttons */
-const EXT_LOGO_SVG =
-  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="14" height="14" fill="currentColor" style="pointer-events:none"><path d="M12.01 21.49L2.39 9.75C2.14 9.45 2 9.07 2 8.67V3.5c0-.83.67-1.5 1.5-1.5h17c.83 0 1.5.67 1.5 1.5v5.17c0 .4-.14.78-.39 1.08l-9.6 11.74zm-8.01-18v5.06l8 9.77 8-9.77V3.49H4zm8 11.06l-4.89-5.97h9.78L12 14.55z"/></svg>';
+/** Extension logo mark for in-field buttons (resolved via background to keep icon-svg.ts out of content bundle). */
+let _extLogoSvg: Promise<string> | null = null;
+function getExtLogoSvg(): Promise<string> {
+  if (!_extLogoSvg) {
+    _extLogoSvg = getIconSvgViaBg('logoMark', { size: 14, color: 'currentColor' });
+  }
+  return _extLogoSvg;
+}
 
-async function openExtensionForReason(reason: AutofillBlockReason, hint: string): Promise<void> {
+async function openExtensionForReason(
+  reason: AutofillBlockReason | 'create-identity' | 'edit-identity' | string,
+  hint: string,
+  extra?: { identityId?: string }
+): Promise<void> {
   try {
-    await browser.runtime.sendMessage({
+    await sendMessageViaBg({
       type: 'openExtensionUi',
       reason: reason || 'setup',
       hint,
+      identityId: extra?.identityId || '',
     });
   } catch (e) {
     logError('Failed to open extension UI', e);
@@ -103,14 +195,15 @@ async function ensureAutofillReady(inputField?: HTMLElement): Promise<boolean> {
   await openExtensionForReason(block, msg);
   // Flag so UI can show “return to form after setup”
   try {
-    await browser.storage.session.set({
+    await setStorageViaBg({
       pendingAutofillReturn: true,
       pendingAutofillUrl: typeof location !== 'undefined' ? location.href : '',
       pendingAutofillAt: Date.now(),
     });
   } catch {
+    /* ignore */
     try {
-      await browser.storage.local.set({
+      await setStorageViaBg({
         pendingAutofillReturn: true,
         pendingAutofillUrl: typeof location !== 'undefined' ? location.href : '',
         pendingAutofillAt: Date.now(),
@@ -198,7 +291,7 @@ if (typeof document !== 'undefined') {
 
 async function showAutofillPopup(
   inputField: HTMLInputElement | HTMLSelectElement,
-  form: HTMLFormElement,
+  form: HTMLElement,
   isEmail: boolean,
   isPassword: boolean,
   isPhone: boolean,
@@ -222,7 +315,7 @@ async function showAutofillPopup(
   popupDiv.className = POPUP_CLASS;
   popupDiv.style.cssText = `
     position: fixed;
-    z-index: 2147483647;
+    z-index: ${CONTENT_Z.popup};
     pointer-events: auto;
     background-color: var(--md-surface-container);
     border: 1px solid var(--md-outline-variant);
@@ -251,8 +344,10 @@ async function showAutofillPopup(
     text-transform: uppercase;
     letter-spacing: 0.5px;
   `;
-  const logoSvg =
-    '<svg style="pointer-events: none; color: var(--md-primary); fill: currentColor;" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16"><path d="M12.01 21.49L2.39 9.75C2.14 9.45 2 9.07 2 8.67V3.5c0-.83.67-1.5 1.5-1.5h17c.83 0 1.5.67 1.5 1.5v5.17c0 .4-.14.78-.39 1.08l-9.6 11.74zm-8.01-18v5.06l8 9.77 8-9.77V3.49H4zm8 11.06l-4.89-5.97h9.78L12 14.55z"/></svg>';
+  const logoSvg = await getIconSvgViaBg('logoMark', {
+    size: 16,
+    color: 'var(--md-primary, #4c662b)',
+  });
   const headerTitle = await t('contentAutofill.popupTitle');
   header.innerHTML = `${logoSvg}<span></span>`;
   const titleSpan = header.querySelector('span');
@@ -313,17 +408,20 @@ async function showAutofillPopup(
     labelSpan.innerText = label;
     item.appendChild(labelSpan);
 
-    item.addEventListener('click', async (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      try {
-        await onClick();
-      } catch (err) {
-        logError('Popup item action error:', err);
-      } finally {
-        closeActivePopup();
-      }
-    });
+    item.addEventListener(
+      'click',
+      trustedClick(async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        try {
+          await onClick();
+        } catch (err) {
+          logError('Popup item action error:', err);
+        } finally {
+          closeActivePopup();
+        }
+      })
+    );
 
     popupDiv.appendChild(item);
     return item;
@@ -331,7 +429,7 @@ async function showAutofillPopup(
 
   // Build options list
   if (isEmail) {
-    const { activeInboxId, inboxes = [] } = (await browser.storage.local.get([
+    const { activeInboxId, inboxes = [] } = (await getStorageViaBg([
       'activeInboxId',
       'inboxes',
     ])) as {
@@ -358,7 +456,7 @@ async function showAutofillPopup(
     if (activeInbox) {
       addItem(
         activeInbox.address,
-        `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/></svg>`,
+        await getIconSvgViaBg('mailSolid', { size: 16 }),
         async () => {
           if (await isEmailUsedInSavedLogins(activeInbox.address)) {
             showConflictChip(
@@ -378,22 +476,18 @@ async function showAutofillPopup(
 
     const otherInboxes = liveInboxes.filter((i) => i.id !== activeInbox?.id);
     for (const inbox of otherInboxes.slice(0, 3)) {
-      addItem(
-        inbox.address,
-        `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/></svg>`,
-        async () => {
-          if (await isEmailUsedInSavedLogins(inbox.address)) {
-            showConflictChip(
-              inputField as HTMLInputElement,
-              await t('contentAutofill.emailAlreadyUsedChip')
-            );
-            await generateAndFillNewEmail(form, inputField, updateAndCopyCredentials);
-            return;
-          }
-          fillAllEmailFields(form, inbox.address, inputField as HTMLInputElement);
-          await updateAndCopyCredentials({ email: inbox.address });
+      addItem(inbox.address, await getIconSvgViaBg('mailSolid', { size: 16 }), async () => {
+        if (await isEmailUsedInSavedLogins(inbox.address)) {
+          showConflictChip(
+            inputField as HTMLInputElement,
+            await t('contentAutofill.emailAlreadyUsedChip')
+          );
+          await generateAndFillNewEmail(form, inputField, updateAndCopyCredentials);
+          return;
         }
-      );
+        fillAllEmailFields(form, inbox.address, inputField as HTMLInputElement);
+        await updateAndCopyCredentials({ email: inbox.address });
+      });
     }
 
     const hr = document.createElement('div');
@@ -402,7 +496,7 @@ async function showAutofillPopup(
 
     addItem(
       await t('contentAutofill.generateNewEmail'),
-      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>`,
+      await getIconSvgViaBg('plus', { size: 16 }),
       async () => {
         await generateAndFillNewEmail(form, inputField, updateAndCopyCredentials);
       }
@@ -410,7 +504,7 @@ async function showAutofillPopup(
   } else if (isPassword) {
     addItem(
       await t('contentAutofill.generatePassword'),
-      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M12.65 10C11.83 7.67 9.61 6 7 6c-3.31 0-6 2.69-6 6s2.69 6 6 6c2.61 0 4.83-1.67 5.65-4H17v4h4v-4h2v-4H12.65zM7 14c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/></svg>`,
+      await getIconSvgViaBg('lock', { size: 16 }),
       async () => {
         const password = await getPasswordToFill(inputField as HTMLInputElement, form);
         fillInputValue(inputField as HTMLInputElement, password);
@@ -430,9 +524,9 @@ async function showAutofillPopup(
   } else if (isPhone) {
     addItem(
       await t('contentAutofill.generatePhone'),
-      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M17 1.01L7 1c-1.1 0-2 .9-2 2v18c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2V3c0-1.1-.9-1.99-2-1.99zM17 19H7V5h10v14z"/></svg>`,
+      await getIconSvgViaBg('phone', { size: 16 }),
       async () => {
-        const phone = generatePhoneNumber();
+        const phone = await generateIdentityViaBg('phoneNumber');
         fillInputValue(inputField as HTMLInputElement, phone);
         await updateAndCopyCredentials({ phone });
       },
@@ -441,9 +535,9 @@ async function showAutofillPopup(
   } else if (isUsername) {
     addItem(
       await t('contentAutofill.generateUsername'),
-      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>`,
+      await getIconSvgViaBg('user', { size: 16 }),
       async () => {
-        const username = generateUsername();
+        const username = await generateIdentityViaBg('username');
         fillInputValue(inputField as HTMLInputElement, username);
         await updateAndCopyCredentials({ username });
       },
@@ -457,7 +551,7 @@ async function showAutofillPopup(
         : await t('contentAutofill.fillFullName');
     addItem(
       label,
-      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>`,
+      await getIconSvgViaBg('user', { size: 16 }),
       async () => {
         const names = await getNamesToFill();
         const value = isFirstName ? names.firstName : isLastName ? names.lastName : names.fullName;
@@ -469,9 +563,9 @@ async function showAutofillPopup(
   } else if (isWebsite) {
     addItem(
       await t('contentAutofill.generateWebsite'),
-      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>`,
+      await getIconSvgViaBg('globe', { size: 16 }),
       async () => {
-        const website = generateWebsiteUrl();
+        const website = await generateIdentityViaBg('websiteUrl');
         fillInputValue(inputField as HTMLInputElement, website);
         await updateAndCopyCredentials({ website });
       },
@@ -481,10 +575,10 @@ async function showAutofillPopup(
     // Generic fill via entire form for selects/checkboxes
     addItem(
       await t('contentAutofill.autofillEntireForm'),
-      EXT_LOGO_SVG,
+      await getExtLogoSvg(),
       async () => {
         if (!(await ensureAutofillReady(inputField))) return;
-        const { identities = [], selectedIdentityId } = (await browser.storage.local.get([
+        const { identities = [], selectedIdentityId } = (await getStorageViaBg([
           'identities',
           'selectedIdentityId',
         ])) as {
@@ -513,10 +607,10 @@ async function showAutofillPopup(
   if (!isCheckbox && !isSelect) {
     addItem(
       await t('contentAutofill.autofillEntireForm'),
-      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" style="fill: currentColor;"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-2 8h-3v3c0 .55-.45 1-1 1s-1-.45-1-1v-3H9c-.55 0-1-.45-1-1s.45-1 1-1h3V7c0-.55.45-1 1-1s1 .45 1 1v3h3c.55 0 1 .45 1 1s-.45 1-1 1z"/></svg>`,
+      await getIconSvgViaBg('autofillForm', { size: 16 }),
       async () => {
         if (!(await ensureAutofillReady(inputField))) return;
-        const { identities = [], selectedIdentityId } = (await browser.storage.local.get([
+        const { identities = [], selectedIdentityId } = (await getStorageViaBg([
           'identities',
           'selectedIdentityId',
         ])) as {
@@ -564,7 +658,7 @@ async function showAutofillPopup(
 }
 
 export async function injectAutoFillButtons(
-  form: HTMLFormElement,
+  form: HTMLFormElement | HTMLElement,
   injectedButtons: HTMLElement[],
   updatePositionListeners: Array<() => void>,
   autoFillButtonsInjected: { value: boolean },
@@ -577,10 +671,10 @@ export async function injectAutoFillButtons(
   // Site profile + saved logins for domain (any inbox). Best-effort.
   let replayCredential: ReusableCredential | null = null;
   try {
-    const { activeInboxId } = (await browser.storage.local.get(['activeInboxId'])) as {
+    const { activeInboxId } = (await getStorageViaBg(['activeInboxId'])) as {
       activeInboxId?: string;
     };
-    const response = (await browser.runtime.sendMessage({
+    const response = (await sendMessageViaBg({
       action: 'findSiteReplay',
       domain: window.location.hostname,
       inboxId: activeInboxId || '',
@@ -596,7 +690,7 @@ export async function injectAutoFillButtons(
     // If we have a known last inbox for this site, prefer it as active for OTP wait
     if (response?.lastInboxId && response.lastInboxId !== activeInboxId) {
       try {
-        await browser.storage.local.set({ activeInboxId: response.lastInboxId });
+        await setStorageViaBg({ activeInboxId: response.lastInboxId });
       } catch {
         /* ignore */
       }
@@ -620,38 +714,54 @@ export async function injectAutoFillButtons(
     const isCheckbox = !isSelect && (inputField as HTMLInputElement).type === 'checkbox';
     const isInput = !isSelect;
     const el = inputField as HTMLInputElement;
-    const name = (el.name || '').toLowerCase();
-    const id = (el.id || '').toLowerCase();
-    const ph = (el.placeholder || '').toLowerCase();
+    const name = safeName(el).toLowerCase();
+    const id = safeId(el).toLowerCase();
+    const ph = safePlaceholder(el).toLowerCase();
     const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
     const aria = (el.getAttribute('aria-label') || '').toLowerCase();
     const blob = `${name} ${id} ${ph} ${ac} ${aria}`;
 
     const isEmail =
       isInput &&
+      el.type !== 'password' &&
       (el.type === 'email' ||
         ac === 'email' ||
         ac === 'username email' ||
-        /email|e-mail|mail/.test(blob));
+        /email|e-mail|correo|courriel|メール|邮箱/.test(blob));
 
+    // Password ONLY when type/autocomplete/name clearly say password — never username/handle
     const isPassword =
       isInput &&
+      !/user\s*name|username|userid|user_id|handle|nickname/.test(blob) &&
       (el.type === 'password' ||
         ac === 'new-password' ||
         ac === 'current-password' ||
-        /password|passwd|pwd/.test(blob));
+        (/password|passwd|\bpwd\b|passcode|new-password|current-password/.test(blob) &&
+          el.type !== 'email' &&
+          el.type !== 'tel'));
 
     const isPhone =
       isInput &&
+      !isEmail &&
+      !isPassword &&
       (el.type === 'tel' ||
         ac === 'tel' ||
         ac.startsWith('tel-') ||
         /phone|mobile|cellphone|cell/.test(blob));
 
+    // Real username/handle only — autocomplete=username alone is often login EMAIL
     const isUsername =
       isInput &&
       !isEmail &&
-      (ac === 'username' || /username|userid|user_id|login|nickname|handle/.test(blob));
+      !isPassword &&
+      el.type !== 'password' &&
+      el.type !== 'email' &&
+      (/user\s*name|username|userid|user_id|user-name|nickname|handle|login\s*name|account\s*name/.test(
+        blob
+      ) ||
+        (ac === 'username' &&
+          /user|handle|nick|login/.test(`${name} ${id} ${ph} ${aria}`) &&
+          !/email|mail|phone|mobile/.test(blob)));
 
     const isFirstName =
       isInput &&
@@ -693,7 +803,7 @@ export async function injectAutoFillButtons(
     buttonContainer.className = CONTAINER_CLASS;
     buttonContainer.style.cssText = `
       position: fixed;
-      z-index: 10000;
+      z-index: ${CONTENT_Z.button};
       pointer-events: auto;
       display: flex;
       align-items: center;
@@ -746,7 +856,7 @@ export async function injectAutoFillButtons(
     autoFillButton.onmouseup = () => {
       autoFillButton.style.transform = 'scale(1)';
     };
-    appendSvgIcon(autoFillButton, EXT_LOGO_SVG);
+    appendSvgIcon(autoFillButton, await getExtLogoSvg());
 
     autoFillButton.addEventListener('click', async (event: MouseEvent) => {
       if (!event.isTrusted) {
@@ -784,7 +894,7 @@ export async function injectAutoFillButtons(
           return;
         }
         if (isPhone) {
-          const phone = generatePhoneNumber();
+          const phone = await generateIdentityViaBg('phoneNumber');
           fillInputValue(inputField as HTMLInputElement, phone);
           await updateAndCopyCredentials({ phone });
           await showTooltip(
@@ -795,7 +905,7 @@ export async function injectAutoFillButtons(
           return;
         }
         if (isUsername) {
-          const username = generateUsername();
+          const username = await generateIdentityViaBg('username');
           fillInputValue(inputField as HTMLInputElement, username);
           await updateAndCopyCredentials({ username });
           await showTooltip(
@@ -822,7 +932,7 @@ export async function injectAutoFillButtons(
           return;
         }
         if (isWebsite) {
-          const website = generateWebsiteUrl();
+          const website = await generateIdentityViaBg('websiteUrl');
           fillInputValue(inputField as HTMLInputElement, website);
           await updateAndCopyCredentials({ website });
           await showTooltip(
@@ -894,7 +1004,7 @@ type IdentityFill = {
 };
 
 async function runFillAll(
-  form: HTMLFormElement,
+  form: HTMLFormElement | HTMLElement,
   updateAndCopyCredentials: (creds: Record<string, string>) => Promise<void>,
   identityForFill: IdentityFill | undefined,
   replayCredential: ReusableCredential | null,
@@ -909,17 +1019,58 @@ async function runFillAll(
   let identity = identityForFill;
   let formScore: import('@/features/intelligence/types.js').FormScore | null = null;
 
+  // Smart settings + multi-level undo
   try {
-    const { buildAutofillPlan } = await import('@/features/intelligence/autofill-plan.js');
+    const smart = (await loadSmartAutofillSettingsViaBg()) as { undoStackDepth: number };
+    const stack = getFormUndoStack(form, smart.undoStackDepth);
+    stack.push(form, 'pre-autofill');
+  } catch {
+    /* optional */
+  }
+
+  // Freshness: prefer unused identity+email for generate path
+  if (!replayCredential && !identity) {
+    try {
+      const { identities = [], inboxes = [] } = (await getStorageViaBg([
+        'identities',
+        'inboxes',
+      ])) as {
+        identities?: IdentityFill[];
+        inboxes?: Array<{ address?: string; status?: string; accountStatus?: string }>;
+      };
+      const live = (inboxes || [])
+        .filter(
+          (i) =>
+            i.address &&
+            i.accountStatus !== 'archived' &&
+            i.accountStatus !== 'deleted' &&
+            i.status !== 'expired'
+        )
+        .map((i) => i.address as string);
+      const pick = (await pickFreshestIdentityViaBg(
+        planDomain,
+        identities as unknown as import('@/utils/types.js').Identity[],
+        live
+      )) as { identity: import('@/utils/types.js').Identity; identityId: string } | null;
+      if (pick) {
+        identity = pick.identity as unknown as IdentityFill;
+        planIdentityId = pick.identityId;
+      }
+    } catch {
+      /* optional */
+    }
+  }
+
+  try {
     const plan = await buildAutofillPlan(form, {
       domain: planDomain,
       replayCredential,
-      selectedIdentityId: identityForFill?.id,
+      selectedIdentityId: identityForFill?.id || identity?.id,
     });
     formScore = plan.formScore;
     usedReplay = plan.useReplay && !!replayCredential;
     if (!identity && plan.identityId) {
-      const { identities = [] } = (await browser.storage.local.get(['identities'])) as {
+      const { identities = [] } = (await getStorageViaBg(['identities'])) as {
         identities?: IdentityFill[];
       };
       identity = identities.find((i) => i.id === plan.identityId);
@@ -929,7 +1080,53 @@ async function runFillAll(
     /* intelligence optional */
   }
 
+  // Dry-run preview (optional)
   try {
+    const smart = (await loadSmartAutofillSettingsViaBg()) as { dryRunPreview: boolean } | null;
+    if (smart?.dryRunPreview && !usedReplay) {
+      const meta = await getActiveInboxMetaViaBg();
+      const ok = await showDryRunPreview({
+        title: await t('contentAutofill.dryRunTitle'),
+        confirmLabel: await t('contentAutofill.dryRunConfirm'),
+        cancelLabel: await t('contentAutofill.dryRunCancel'),
+        rows: [
+          {
+            label: await t('messages.identity'),
+            value: identity?.name || (await t('contentAutofill.dryRunEmpty')),
+          },
+          {
+            label: await t('messages.email'),
+            value:
+              meta?.address || identity?.preferredEmail || (await t('contentAutofill.dryRunEmpty')),
+          },
+          {
+            label: await t('messages.name'),
+            value:
+              `${identity?.firstNames || ''} ${identity?.lastNames || ''}`.trim() ||
+              (await t('contentAutofill.dryRunEmpty')),
+          },
+          {
+            label: await t('messages.phone'),
+            value: identity?.phone || (await t('contentAutofill.dryRunAutoMode')),
+            kind: 'phone',
+          },
+          { label: await t('messages.password'), value: '••••••••', kind: 'password' },
+        ],
+      });
+      if (!ok) return;
+    }
+  } catch {
+    /* optional */
+  }
+
+  try {
+    // Human-like pause before fill starts
+    try {
+      await maybeHumanDelay();
+    } catch {
+      /* ignore */
+    }
+
     const success = await fillSignupForm(
       form,
       updateAndCopyCredentials,
@@ -938,18 +1135,40 @@ async function runFillAll(
     );
 
     try {
-      const { getActiveInboxMeta } = await import('@/features/intelligence/autofill-plan.js');
-      const { recordAutofillOutcome } = await import('@/features/intelligence/site-memory.js');
-      const meta = await getActiveInboxMeta();
-      void recordAutofillOutcome({
-        domain: planDomain,
-        success,
-        identityId: planIdentityId || identity?.id,
-        inboxId: meta.inboxId,
-        email: meta.address,
-        formScore,
-        usedReplay,
-      });
+      const meta = await getActiveInboxMetaViaBg();
+      if (meta) {
+        void recordAutofillOutcomeViaBg({
+          domain: planDomain,
+          success,
+          identityId: planIdentityId || identity?.id,
+          inboxId: meta?.inboxId,
+          email: meta.address,
+          formScore: formScore as unknown,
+          usedReplay,
+        });
+      }
+      if (success) {
+        void recordAutofillSuccessViaBg(planDomain);
+        // detectWizardStepFromPage is inlined in content-bg-bridge (DOM access needed)
+        void upsertWizardSessionViaBg({
+          domain: planDomain,
+          step: detectWizardStepFromPage() === 'otp' ? 'otp' : 'form',
+          email: meta?.address ?? null,
+          identityId: planIdentityId || identity?.id,
+          inboxId: meta?.inboxId ?? null,
+          paths: [location.pathname],
+          filled: { email: meta?.address || '' },
+        });
+      } else {
+        const fail = await recordAutofillFailureViaBg(planDomain);
+        if (fail?.shouldSuggestBlock) {
+          void showTooltip(
+            anchorEl,
+            await t('contentAutofill.suggestBlockSite', { domain: planDomain }),
+            true
+          );
+        }
+      }
     } catch {
       /* ignore memory write */
     }
@@ -959,27 +1178,80 @@ async function runFillAll(
     }
     if (success) {
       try {
-        const { getActiveInboxMeta } = await import('@/features/intelligence/autofill-plan.js');
-        const meta = await getActiveInboxMeta();
+        const meta = await getActiveInboxMetaViaBg();
         const email =
-          meta.address ||
+          meta?.address ||
           (usedReplay ? replayCredential?.email : null) ||
           identity?.preferredEmail ||
           '';
         const idName = identity?.name || '';
-        const provider = meta.providerDisplay || meta.provider || '';
+        const provider = meta?.providerDisplay || meta?.provider || '';
         const statusText = await t('contentAutofill.fillMicroStatus', {
           identity: idName || '—',
           email: email || '—',
           provider: provider || '—',
         });
         showFillMicroStatus(anchorEl, statusText);
-        const { showWaitOtpPanel } = await import('../otp/wait-otp-panel.js');
-        void showWaitOtpPanel({
-          email: email || null,
-          autoFill: true,
-        });
+
+        // Smart OTP attach
+        try {
+          const smart = (await loadSmartAutofillSettingsViaBg()) as {
+            smartOtpAttach: boolean;
+          } | null;
+          if (smart?.smartOtpAttach) {
+            void showWaitOtpPanel({
+              email: email || null,
+              autoFill: true,
+              skipIfNotVerificationPage: true,
+            });
+          }
+        } catch {
+          /* ignore */
+          void showWaitOtpPanel({
+            email: email || null,
+            autoFill: true,
+            skipIfNotVerificationPage: true,
+          });
+        }
+
+        // Conflict watch → auto new inbox
+        try {
+          watchEmailConflict(form, () => {
+            void (async () => {
+              const fresh = await createFreshInboxAddress();
+              if (fresh) {
+                fillAllEmailFields(form, fresh);
+                await updateAndCopyCredentials({ email: fresh });
+                await showTooltip(
+                  anchorEl,
+                  await t('contentAutofill.conflictNewEmail', { email: fresh }),
+                  false
+                );
+              }
+            })();
+          });
+        } catch {
+          /* optional */
+        }
+
+        // Only treat as signup success after Continue/Sign up is clicked (auto-click + watch)
+        try {
+          armSignupOutcomeAfterSubmit(planDomain, form, {
+            autoClick: true,
+            timeoutMs: 90_000,
+          });
+        } catch {
+          /* optional */
+        }
+
+        // Multi-step SPA: email → name → OTP (generic — no site hardcoding)
+        try {
+          void startMultiStepOtpWatch({ email: email || null });
+        } catch {
+          /* optional */
+        }
       } catch {
+        /* ignore */
         await showTooltip(anchorEl, await t('contentAutofill.fillSuccess'), false);
       }
     } else {
@@ -987,12 +1259,11 @@ async function runFillAll(
     }
   } catch (error: unknown) {
     try {
-      const { recordAutofillOutcome } = await import('@/features/intelligence/site-memory.js');
-      void recordAutofillOutcome({
+      void recordAutofillOutcomeViaBg({
         domain: planDomain,
         success: false,
         identityId: planIdentityId || identity?.id,
-        formScore,
+        formScore: formScore as unknown,
         usedReplay,
       });
     } catch {
@@ -1004,41 +1275,69 @@ async function runFillAll(
 }
 
 async function addFillAllButton(
-  form: HTMLFormElement,
+  form: HTMLFormElement | HTMLElement,
   injectedButtons: HTMLElement[],
   updatePositionListeners: Array<() => void>,
   updateAndCopyCredentials: (creds: Record<string, string>) => Promise<void>,
   replayCredential: ReusableCredential | null
 ): Promise<void> {
-  // Only show Autofill All on high-confidence signup forms (not every page)
+  // Autofill All: high-confidence signup OR progressive multi-step OR sign-in
+  let formIntent: ReturnType<typeof classifyFormIntent> = 'unknown';
   try {
-    if (scoreSignupForm(form) < 55) return;
+    if (form instanceof HTMLFormElement) {
+      formIntent = classifyFormIntent(form);
+    } else {
+      // Non-form progressive containers (email → continue) count as signup path
+      formIntent = 'signup';
+    }
+    const score = scoreSignupForm(form);
+    // Progressive SPA / social signup steps often score 30–54
+    if (score < 32 && formIntent !== 'signin' && formIntent !== 'signup') return;
+    // Explicit signup intent or progressive container always show Autofill All
+    if (score < 28 && formIntent === 'unknown') return;
   } catch {
+    /* ignore */
     return;
   }
+
+  const isSignin =
+    form instanceof HTMLFormElement && (formIntent === 'signin' || isSigninForm(form));
+  const isSignup =
+    !isSignin &&
+    (formIntent === 'signup' || (form instanceof HTMLFormElement && isSignupForm(form)));
+  // Reuse identity ONLY on sign-in pages — never on signup
+  const isReplay = !!(replayCredential && isSignin);
+  // Signup + existing site credential → suggest a different / new identity
+  const hasExistingCredsOnSignup = !!(replayCredential && isSignup && !isSignin);
 
   const buttonContainer = document.createElement('div');
   buttonContainer.className = `${CONTAINER_CLASS} fill-all-container`;
   buttonContainer.style.cssText = `
-    position: fixed;
-    z-index: 10000;
-    pointer-events: auto;
-    display: inline-flex;
-    align-items: stretch;
-    opacity: 0.95;
+    position: fixed !important;
+    z-index: ${CONTENT_Z.tooltip} !important;
+    pointer-events: auto !important;
+    display: inline-flex !important;
+    align-items: center;
+    opacity: 0.95 !important;
+    visibility: visible !important;
     transition: opacity 0.2s;
     border-radius: 20px;
     overflow: hidden;
     box-shadow: 0 2px 8px rgba(0,0,0,0.18);
+    white-space: nowrap;
+    flex-shrink: 0;
+    min-width: fit-content;
+    flex-wrap: nowrap;
   `;
 
-  const isReplay = !!replayCredential;
   const fillAllButton = document.createElement('button');
   fillAllButton.type = 'button';
   fillAllButton.className = `${BUTTON_CLASS} fill-all-button`;
   fillAllButton.title = isReplay
     ? await t('contentAutofill.reuseTitle')
-    : await t('contentAutofill.fillAllTitle');
+    : hasExistingCredsOnSignup
+      ? await t('contentAutofill.existingCredsSignupTitle')
+      : await t('contentAutofill.fillAllTitle');
   fillAllButton.style.cssText = `
     background-color: var(--md-primary, #4c662b);
     color: var(--md-on-primary, #fff);
@@ -1046,19 +1345,26 @@ async function addFillAllButton(
     border-radius: 0;
     padding: 7px 12px;
     cursor: pointer;
-    display: flex;
+    display: inline-flex;
     align-items: center;
     gap: 6px;
     font-size: 12px;
     font-weight: 600;
     font-family: system-ui, sans-serif;
+    white-space: nowrap;
+    flex-shrink: 0;
   `;
-  appendSvgIcon(fillAllButton, EXT_LOGO_SVG);
+  appendSvgIcon(fillAllButton, await getExtLogoSvg());
   const labelSpan = document.createElement('span');
   labelSpan.textContent = isReplay
     ? await t('contentAutofill.reuseIdentity')
-    : await t('contentAutofill.autofillAll');
+    : hasExistingCredsOnSignup
+      ? await t('contentAutofill.newIdentityFill')
+      : await t('contentAutofill.autofillAll');
   fillAllButton.appendChild(labelSpan);
+
+  // Pre-fill snapshot for Reset after Autofill All
+  let preFillSnapshot: FieldSnapshot[] | null = null;
 
   // Chevron opens identity picker
   const menuBtn = document.createElement('button');
@@ -1073,26 +1379,80 @@ async function addFillAllButton(
     border-inline-start: 1px solid rgba(255,255,255,0.25);
     padding: 0 8px;
     cursor: pointer;
-    display: flex;
+    display: inline-flex;
     align-items: center;
     font-size: 12px;
+    flex-shrink: 0;
   `;
-  menuBtn.textContent = '▾';
+  menuBtn.innerHTML = await getIconSvgViaBg('chevronDown', { size: 14, color: 'currentColor' });
+  const chevronIconSpan = menuBtn.querySelector('span');
+  if (chevronIconSpan) {
+    chevronIconSpan.style.flexShrink = '0';
+  }
 
   const setFillLabel = (text: string) => {
     labelSpan.textContent = text;
     fillAllButton.title = text;
   };
 
-  const runWithIdentity = async (id?: IdentityFill) => {
-    await runFillAll(
-      form,
-      updateAndCopyCredentials,
-      id,
-      replayCredential,
-      fillAllButton,
-      setFillLabel
-    );
+  // Wait for OTP chip — revealed after successful fill or matching manual email entry
+  const waitOtpBtn = document.createElement('button');
+  waitOtpBtn.type = 'button';
+  waitOtpBtn.className = BUTTON_CLASS;
+  waitOtpBtn.title = await t('contentAutofill.waitForOtpTitle');
+  waitOtpBtn.style.cssText = `
+    background-color: var(--md-secondary-container, #dce7c8);
+    color: var(--md-on-secondary-container, #404a33);
+    border: none;
+    border-inline-start: 1px solid rgba(0,0,0,0.08);
+    padding: 7px 10px;
+    cursor: pointer;
+    display: none;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    font-family: system-ui, sans-serif;
+    white-space: nowrap;
+  `;
+  waitOtpBtn.textContent = await t('contentAutofill.waitForOtpShort');
+  waitOtpBtn.addEventListener('click', async (event: MouseEvent) => {
+    if (!event.isTrusted) return;
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      const meta = await getActiveInboxMetaViaBg();
+      await showWaitOtpPanel({
+        email: meta?.address || replayCredential?.email || null,
+        autoFill: true,
+      });
+    } catch {
+      /* ignore */
+    }
+  });
+
+  const showWaitOtpButton = () => {
+    waitOtpBtn.style.display = 'flex';
+  };
+
+  const showResetButton = () => {
+    resetBtn.style.display = 'flex';
+  };
+
+  const runWithIdentity = async (id?: IdentityFill, forceGenerate = false) => {
+    // Snapshot once before first fill so Reset can undo incomplete signups
+    if (!preFillSnapshot) preFillSnapshot = snapshotFormFields(form);
+    // Reuse only on sign-in; signup always generates (even if site has saved creds)
+    const replay =
+      isReplay && !forceGenerate && !hasExistingCredsOnSignup ? replayCredential : null;
+    await runFillAll(form, updateAndCopyCredentials, id, replay, fillAllButton, setFillLabel);
+    showResetButton();
+    // After Autofill All, reveal Wait-for-OTP if form now has a known extension email
+    try {
+      if (await formEmailMatchesExtensionInbox(form)) showWaitOtpButton();
+    } catch {
+      /* ignore */
+    }
   };
 
   fillAllButton.addEventListener('click', async (event: MouseEvent) => {
@@ -1102,31 +1462,48 @@ async function addFillAllButton(
     }
     event.preventDefault();
     event.stopPropagation();
+    // Signup already has credentials for this site → open identity menu path
+    if (hasExistingCredsOnSignup) {
+      try {
+        await showTooltip(fillAllButton, await t('contentAutofill.existingCredsSignupHint'), false);
+      } catch {
+        /* ignore */
+      }
+    }
     // Identity routing (sticky / domain hints / selected / default)
     try {
-      const { routeIdentityForDomain } = await import('@/features/intelligence/identity-router.js');
-      const { identities = [], selectedIdentityId } = (await browser.storage.local.get([
+      const { identities = [], selectedIdentityId } = (await getStorageViaBg([
         'identities',
         'selectedIdentityId',
       ])) as { identities?: IdentityFill[]; selectedIdentityId?: string };
-      const routed = await routeIdentityForDomain(
-        window.location.hostname,
-        identities as unknown as import('@/utils/types.js').Identity[],
-        selectedIdentityId
-      );
-      const selected =
-        (routed.identity as IdentityFill | null) ||
-        identities.find((i) => i.id === selectedIdentityId) ||
-        identities[0];
-      // Prefer replay when available; otherwise generate with routed identity
-      await runWithIdentity(replayCredential ? undefined : selected);
+      let selected: IdentityFill | undefined;
+      if (hasExistingCredsOnSignup && identities.length > 1) {
+        // Prefer a different identity than the one last used for this domain
+        const lastId = (replayCredential as { identityId?: string } | null)?.identityId;
+        selected =
+          identities.find((i) => i.id !== lastId && i.id !== selectedIdentityId) ||
+          identities.find((i) => i.id !== lastId) ||
+          identities.find((i) => i.id !== selectedIdentityId) ||
+          identities[0];
+      } else {
+        const routed = (await routeIdentityForDomainViaBg(
+          window.location.hostname,
+          identities as unknown as import('@/utils/types.js').Identity[],
+          selectedIdentityId
+        )) as { identity: IdentityFill | null; identityId: string | null } | null;
+        selected =
+          routed?.identity || identities.find((i) => i.id === selectedIdentityId) || identities[0];
+      }
+      // Reuse only on sign-in; signup always generate
+      await runWithIdentity(isReplay ? undefined : selected, hasExistingCredsOnSignup);
     } catch {
-      const { identities = [], selectedIdentityId } = (await browser.storage.local.get([
+      /* ignore */
+      const { identities = [], selectedIdentityId } = (await getStorageViaBg([
         'identities',
         'selectedIdentityId',
       ])) as { identities?: IdentityFill[]; selectedIdentityId?: string };
       const selected = identities.find((i) => i.id === selectedIdentityId) || identities[0];
-      await runWithIdentity(replayCredential ? undefined : selected);
+      await runWithIdentity(isReplay ? undefined : selected, hasExistingCredsOnSignup);
     }
   });
 
@@ -1139,7 +1516,7 @@ async function addFillAllButton(
       event.stopImmediatePropagation?.();
       closeActivePopup();
 
-      const { identities = [], selectedIdentityId } = (await browser.storage.local.get([
+      const { identities = [], selectedIdentityId } = (await getStorageViaBg([
         'identities',
         'selectedIdentityId',
       ])) as { identities?: IdentityFill[]; selectedIdentityId?: string };
@@ -1148,7 +1525,7 @@ async function addFillAllButton(
       menu.className = POPUP_CLASS;
       menu.style.cssText = `
       position: fixed;
-      z-index: 2147483647;
+      z-index: ${CONTENT_Z.popup};
       min-width: 220px;
       max-width: 300px;
       max-height: min(70vh, 360px);
@@ -1164,13 +1541,17 @@ async function addFillAllButton(
       font-size: 13px;
     `;
 
+      const identityFallback = await t('messages.identity');
+      const editLabel = await t('common.edit');
+      const editIdentityLabel = await t('contentAutofill.editIdentity');
+
       const addIdentityRow = (id: IdentityFill, selected: boolean) => {
         const row = document.createElement('div');
         row.style.cssText =
           'display:flex;align-items:center;gap:4px;padding:2px 6px 2px 0;width:100%;box-sizing:border-box;';
         const pick = document.createElement('button');
         pick.type = 'button';
-        pick.textContent = `${selected ? '✓ ' : ''}${id.name || 'Identity'}`;
+        pick.textContent = `${selected ? '✓ ' : ''}${id.name || identityFallback}`;
         pick.style.cssText = `
         flex:1;min-width:0;text-align:start;padding:8px 10px 8px 14px;border:0;background:transparent;
         cursor:pointer;font:inherit;color:inherit;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
@@ -1181,23 +1562,24 @@ async function addFillAllButton(
         pick.onmouseout = () => {
           pick.style.background = 'transparent';
         };
-        const runPick = (e: Event) => {
+        const runPick = (e: MouseEvent) => {
           e.preventDefault();
           e.stopPropagation();
           closeActivePopup();
-          void browser.storage.local.set({ selectedIdentityId: id.id });
-          void runWithIdentity(id);
+          void setStorageViaBg({ selectedIdentityId: id.id });
+          // Always generate with chosen identity on signup (never silent reuse)
+          void runWithIdentity(id, hasExistingCredsOnSignup || !isReplay);
         };
         pick.addEventListener('pointerdown', (e) => {
           e.preventDefault();
           e.stopPropagation();
         });
-        pick.addEventListener('click', runPick);
+        pick.addEventListener('click', trustedClick(runPick));
 
         const edit = document.createElement('button');
         edit.type = 'button';
-        edit.title = 'Edit';
-        edit.setAttribute('aria-label', 'Edit identity');
+        edit.title = editLabel;
+        edit.setAttribute('aria-label', editIdentityLabel);
         edit.textContent = '✎';
         edit.style.cssText = `
         flex-shrink:0;width:32px;height:32px;border:0;border-radius:8px;background:transparent;
@@ -1213,20 +1595,17 @@ async function addFillAllButton(
           e.preventDefault();
           e.stopPropagation();
         });
-        edit.addEventListener('click', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          closeActivePopup();
-          const payload = {
-            openView: 'autofill',
-            autofillTab: 'profiles',
-            openIdentityEditId: id.id,
-            openIdentityCreate: false,
-          };
-          void browser.storage.session.set(payload).catch(() => browser.storage.local.set(payload));
-          void browser.storage.local.set(payload).catch(() => {});
-          void openExtensionForReason('setup', 'edit-identity');
-        });
+        edit.addEventListener(
+          'click',
+          trustedClick((e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            closeActivePopup();
+            // Background owns storage + open (app tab with query + navigateView).
+            // Do not pre-write storage here — it races with open UIs that clear flags.
+            void openExtensionForReason('edit-identity', 'edit-identity', { identityId: id.id });
+          })
+        );
 
         row.appendChild(pick);
         row.appendChild(edit);
@@ -1252,20 +1631,33 @@ async function addFillAllButton(
           e.preventDefault();
           e.stopPropagation();
         });
-        b.addEventListener('click', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          closeActivePopup();
-          onClick();
-        });
+        b.addEventListener(
+          'click',
+          trustedClick((e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            closeActivePopup();
+            onClick();
+          })
+        );
         menu.appendChild(b);
       };
 
+      if (hasExistingCredsOnSignup) {
+        const hint = document.createElement('div');
+        hint.style.cssText =
+          'padding:8px 14px;font-size:11px;line-height:1.35;color:var(--md-on-surface-variant,#444);opacity:0.95;';
+        hint.textContent = await t('contentAutofill.existingCredsSignupMenuHint');
+        menu.appendChild(hint);
+      }
+
       addRow(
-        await t('contentAutofill.autofillAll'),
+        isReplay
+          ? await t('contentAutofill.reuseIdentity')
+          : await t('contentAutofill.autofillAll'),
         () => {
           const selected = identities.find((i) => i.id === selectedIdentityId) || identities[0];
-          void runWithIdentity(selected);
+          void runWithIdentity(selected, hasExistingCredsOnSignup);
         },
         true
       );
@@ -1275,15 +1667,7 @@ async function addFillAllButton(
       }
 
       addRow(await t('contentAutofill.createIdentity'), () => {
-        const payload = {
-          openView: 'autofill',
-          autofillTab: 'profiles',
-          openIdentityCreate: true,
-          openIdentityEditId: '',
-        };
-        void browser.storage.session.set(payload).catch(() => browser.storage.local.set(payload));
-        void browser.storage.local.set(payload).catch(() => {});
-        void openExtensionForReason('setup', 'create-identity');
+        void openExtensionForReason('create-identity', 'create-identity');
       });
 
       // Prevent document capture handler from treating menu as outside
@@ -1303,33 +1687,44 @@ async function addFillAllButton(
       );
 
       getOrCreateShadowRoot()?.appendChild(menu);
-      const rect = menuBtn.getBoundingClientRect();
-      const menuH = Math.min(360, window.innerHeight * 0.7);
-      let top = rect.bottom + 4;
-      if (top + 120 > window.innerHeight) top = Math.max(8, rect.top - menuH - 4);
-      menu.style.top = `${top}px`;
-      menu.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 240))}px`;
+
+      const { cleanup } = trackElementPosition(
+        menu,
+        menuBtn,
+        (btnRect) => {
+          const menuH = Math.min(360, window.innerHeight * 0.7);
+          let top = btnRect.bottom + 4;
+          if (top + 120 > window.innerHeight) top = Math.max(8, btnRect.top - menuH - 4);
+          return {
+            top,
+            left: Math.max(8, Math.min(btnRect.left, window.innerWidth - 240)),
+            visible: true,
+          };
+        },
+        updatePositionListeners
+      );
+
       activePopupInfo = {
         element: menu,
-        cleanup: () => {},
+        cleanup,
       };
     },
     true
   );
 
-  // Wait for OTP — one-click panel (also auto-opens after successful fill)
-  const waitOtpBtn = document.createElement('button');
-  waitOtpBtn.type = 'button';
-  waitOtpBtn.className = BUTTON_CLASS;
-  waitOtpBtn.title = await t('contentAutofill.waitForOtpTitle');
-  waitOtpBtn.style.cssText = `
-    background-color: var(--md-secondary-container, #dce7c8);
-    color: var(--md-on-secondary-container, #404a33);
+  // Reset — undo Autofill All when signup was not completed
+  const resetBtn = document.createElement('button');
+  resetBtn.type = 'button';
+  resetBtn.className = BUTTON_CLASS;
+  resetBtn.title = await t('contentAutofill.resetFillTitle');
+  resetBtn.style.cssText = `
+    background-color: var(--md-surface-variant, #e1e4d5);
+    color: var(--md-on-surface-variant, #44483e);
     border: none;
     border-inline-start: 1px solid rgba(0,0,0,0.08);
     padding: 7px 10px;
     cursor: pointer;
-    display: flex;
+    display: none;
     align-items: center;
     gap: 4px;
     font-size: 11px;
@@ -1337,27 +1732,70 @@ async function addFillAllButton(
     font-family: system-ui, sans-serif;
     white-space: nowrap;
   `;
-  waitOtpBtn.textContent = await t('contentAutofill.waitForOtpShort');
-  waitOtpBtn.addEventListener('click', async (event: MouseEvent) => {
+  resetBtn.textContent = await t('contentAutofill.resetFillShort');
+  resetBtn.addEventListener('click', async (event: MouseEvent) => {
     if (!event.isTrusted) return;
     event.preventDefault();
     event.stopPropagation();
+    // Multi-level undo stack first; fall back to single pre-fill snapshot
+    let undid = false;
     try {
-      const { showWaitOtpPanel } = await import('../otp/wait-otp-panel.js');
-      const { getActiveInboxMeta } = await import('@/features/intelligence/autofill-plan.js');
-      const meta = await getActiveInboxMeta();
-      await showWaitOtpPanel({
-        email: meta.address || replayCredential?.email || null,
-        autoFill: true,
-      });
+      const stack = getFormUndoStack(form);
+      undid = stack.undo();
+      if (stack.canUndo()) {
+        // Keep reset visible for further undos
+        resetBtn.style.display = 'flex';
+      } else {
+        resetBtn.style.display = 'none';
+        preFillSnapshot = null;
+      }
     } catch {
-      /* ignore */
+      /* fall through */
+    }
+    if (!undid && preFillSnapshot) {
+      restoreFormFields(preFillSnapshot);
+      preFillSnapshot = null;
+      resetBtn.style.display = 'none';
+      undid = true;
+    }
+    if (undid) {
+      setFillLabel(
+        isReplay
+          ? await t('contentAutofill.reuseIdentity')
+          : hasExistingCredsOnSignup
+            ? await t('contentAutofill.newIdentityFill')
+            : await t('contentAutofill.autofillAll')
+      );
+      try {
+        await showTooltip(fillAllButton, await t('contentAutofill.resetFillDone'), false);
+      } catch {
+        /* ignore */
+      }
     }
   });
+
+  // Scan email inputs: show OTP when user manually types a known extension email
+  const emailInputs = Array.from(
+    form.querySelectorAll<HTMLInputElement>(
+      'input[type="email"], input[name*="email" i], input[id*="email" i], input[autocomplete="email"]'
+    )
+  );
+  const onEmailInputScan = () => {
+    void formEmailMatchesExtensionInbox(form).then((ok) => {
+      if (ok) showWaitOtpButton();
+    });
+  };
+  for (const input of emailInputs) {
+    input.addEventListener('input', onEmailInputScan);
+    input.addEventListener('change', onEmailInputScan);
+    input.addEventListener('blur', onEmailInputScan);
+  }
+  onEmailInputScan();
 
   buttonContainer.appendChild(fillAllButton);
   buttonContainer.appendChild(menuBtn);
   buttonContainer.appendChild(waitOtpBtn);
+  buttonContainer.appendChild(resetBtn);
 
   // Place after create-account heading / first field (not floating at random form coords)
   const anchor = findAutofillAllAnchor(form);
@@ -1365,6 +1803,37 @@ async function addFillAllButton(
 
   getOrCreateShadowRoot()?.appendChild(buttonContainer);
   injectedButtons.push(buttonContainer);
+
+  updatePositionListeners.push(() => {
+    for (const input of emailInputs) {
+      input.removeEventListener('input', onEmailInputScan);
+      input.removeEventListener('change', onEmailInputScan);
+      input.removeEventListener('blur', onEmailInputScan);
+    }
+  });
+}
+
+/** True when any email-like field in the form holds a live extension inbox address */
+async function formEmailMatchesExtensionInbox(form: ParentNode): Promise<boolean> {
+  try {
+    const { inboxes = [] } = (await getStorageViaBg(['inboxes'])) as {
+      inboxes?: Array<{ address?: string }>;
+    };
+    const known = new Set(
+      (inboxes || []).map((i) => (i.address || '').trim().toLowerCase()).filter(Boolean)
+    );
+    if (known.size === 0) return false;
+    const fields = form.querySelectorAll<HTMLInputElement>(
+      'input[type="email"], input[name*="email" i], input[id*="email" i], input[autocomplete="email"], input[type="text"]'
+    );
+    for (const el of Array.from(fields)) {
+      const v = (el.value || '').trim().toLowerCase();
+      if (v && known.has(v)) return true;
+    }
+  } catch {
+    /* ignore */
+  }
+  return false;
 }
 
 export function removeInjectedButtons(

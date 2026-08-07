@@ -6,29 +6,39 @@
 import { browser } from 'wxt/browser';
 import { EmailService, loadProviderConfig } from '@/utils/email-service.js';
 import { InboxCreationError } from '@/utils/errors.js';
+import { tSync } from '@/utils/i18n-utils.js';
 import { logError } from '@/utils/logger.js';
 import { withInboxLock } from '@/utils/mutex.js';
-import { deriveInboxTiming } from '@/utils/provider-expiry.js';
+import { computePreExpiryWindow, deriveInboxTiming } from '@/utils/provider-expiry.js';
 import { getInboxes, setInboxes } from '@/utils/storage-keys.js';
 import type { Account, NotificationSettings } from '@/utils/types.js';
+import { clearStoredEmails } from './email-storage.js';
 
 type NotificationType = 'expired' | 'renewed' | 'expiring-soon';
 
 let expiryAlarmListenerRegistered = false;
+/** Reentrancy guard: checkInboxExpiry is invoked from the immediate SW-start
+ * pass, the checkInboxExpiry alarm, AND the checkEmails piggyback — overlapping
+ * runs would double-renew and double-notify. Skip while one is in flight. */
+let expiryCheckRunning = false;
 
-function createInboxNotification(type: NotificationType, address: string): void {
+function createInboxNotification(
+  type: NotificationType,
+  address: string,
+  soundEnabled: boolean
+): void {
   const messages: Record<NotificationType, { title: string; message: string }> = {
     expired: {
-      title: 'Inbox Expired',
-      message: `The inbox ${address} has expired. Emails are preserved locally.`,
+      title: tSync('notifications.inboxExpiredTitle'),
+      message: tSync('notifications.inboxExpiredMessage', { address }),
     },
     renewed: {
-      title: 'Inbox Auto-Renewed',
-      message: `The inbox ${address} has been automatically renewed.`,
+      title: tSync('notifications.inboxRenewedTitle'),
+      message: tSync('notifications.inboxRenewedMessage', { address }),
     },
     'expiring-soon': {
-      title: 'Inbox Expiring Soon',
-      message: `The inbox ${address} will expire in less than 1 hour.`,
+      title: tSync('notifications.inboxExpiringSoonTitle'),
+      message: tSync('notifications.inboxExpiringSoonMessage', { address }),
     },
   };
   const { title, message } = messages[type];
@@ -38,10 +48,14 @@ function createInboxNotification(type: NotificationType, address: string): void 
     title,
     message,
     priority: 1,
+    // Respect the soundEnabled toggle: mute the OS notification chime.
+    silent: !soundEnabled,
   });
 }
 
 export async function checkInboxExpiry(): Promise<void> {
+  if (expiryCheckRunning) return;
+  expiryCheckRunning = true;
   try {
     const {
       inboxes = [],
@@ -66,18 +80,35 @@ export async function checkInboxExpiry(): Promise<void> {
       const inbox = updatedInboxes[i];
       const notifyExpiredOnce = () => {
         if (notificationSettings?.enabled && !inbox.expiryNotified) {
-          createInboxNotification('expired', inbox.address);
+          createInboxNotification(
+            'expired',
+            inbox.address,
+            notificationSettings.soundEnabled !== false
+          );
         }
         modifiedInboxes.set(inbox.id, { ...modifiedInboxes.get(inbox.id), expiryNotified: true });
         updatedInboxes[i] = { ...updatedInboxes[i], expiryNotified: true };
       };
 
-      if (inbox.expiresAt && inbox.expiresAt <= now) {
+      const isExpired = !!(inbox.expiresAt && inbox.expiresAt <= now);
+      // Adaptive pre-expiry window: uses measured renewal latency (if available)
+      // so auto-renew fires early enough to complete before the mailbox expires.
+      const preExpiryWindow = computePreExpiryWindow(
+        loadProviderConfig(inbox.provider),
+        (inbox as Account & { renewalLatencyMs?: number }).renewalLatencyMs
+      );
+      const isNearingExpiry = !!(
+        inbox.expiresAt &&
+        inbox.autoExtend &&
+        inbox.expiresAt - now <= preExpiryWindow
+      );
+
+      if (isExpired || isNearingExpiry) {
         if (inbox.autoExtend) {
           const providerConfig = loadProviderConfig(inbox.provider);
           if (!providerConfig.expiry?.renewable) {
             // Provider doesn't support renewal, keep as expired (don't auto-archive)
-            notifyExpiredOnce();
+            if (isExpired) notifyExpiredOnce();
             continue;
           }
           try {
@@ -94,6 +125,9 @@ export async function checkInboxExpiry(): Promise<void> {
 
             const renewalConfig = loadProviderConfig(inbox.provider);
             const currentUser = inbox.emailUser || inbox.address.split('@')[0];
+
+            // Measure actual renewal latency for the adaptive auto-renew window.
+            const renewalStart = Date.now();
             let renewalResponse: Record<string, unknown> = {};
 
             if (renewalConfig.expiry?.renewalMethod) {
@@ -102,12 +136,16 @@ export async function checkInboxExpiry(): Promise<void> {
                 variables: { emailUser: currentUser },
               });
             }
+            const measuredLatencyMs = Date.now() - renewalStart;
 
             const newSidToken =
               typeof renewalResponse.token === 'string'
                 ? renewalResponse.token
                 : inbox.token || inbox.sidToken;
-            const timing = deriveInboxTiming(renewalResponse, providerConfig);
+            // BUG FIX: force renewal base to now so the new window is always future.
+            const timing = deriveInboxTiming(renewalResponse, providerConfig, Date.now(), {
+              renewalBaseNow: true,
+            });
 
             const prevCount = updatedInboxes[i].renewalCount ?? 0;
             const renewalUpdates = {
@@ -117,6 +155,8 @@ export async function checkInboxExpiry(): Promise<void> {
               expiresAt: timing.expiresAt,
               expiryNotified: false,
               renewalCount: prevCount + 1,
+              renewalLatencyMs: measuredLatencyMs,
+              lastRenewalAt: Date.now(),
             };
 
             modifiedInboxes.set(inbox.id, {
@@ -130,15 +170,60 @@ export async function checkInboxExpiry(): Promise<void> {
             };
 
             if (notificationSettings?.enabled) {
-              createInboxNotification('renewed', inbox.address);
+              createInboxNotification(
+                'renewed',
+                inbox.address,
+                notificationSettings.soundEnabled !== false
+              );
             }
           } catch (renewError: unknown) {
             logError('Failed to auto-renew inbox', {
               inboxAddress: inbox.address,
               error: renewError,
             });
-            // Keep as expired
-            notifyExpiredOnce();
+            // BUG FIX (zombie expiry): On repeated renewal failure, apply the user's
+            // expiryAction (archive/delete) so the inbox does not stay in an ever-
+            // retrying expired state. Only retry a few times before giving up.
+            const failCount =
+              (inbox as Account & { renewalFailCount?: number }).renewalFailCount ?? 0;
+            const nextFailCount = failCount + 1;
+            modifiedInboxes.set(inbox.id, {
+              ...modifiedInboxes.get(inbox.id),
+              renewalFailCount: nextFailCount,
+            });
+            updatedInboxes[i] = {
+              ...updatedInboxes[i],
+              renewalFailCount: nextFailCount,
+            };
+            if (nextFailCount >= 3) {
+              // Give up after 3 consecutive failures — apply expiryAction.
+              notifyExpiredOnce();
+              try {
+                const { expiryAction = 'archive' } = (await browser.storage.local.get([
+                  'expiryAction',
+                ])) as { expiryAction?: 'archive' | 'delete' };
+                const actionStatus = expiryAction === 'delete' ? 'deleted' : 'archived';
+                modifiedInboxes.set(inbox.id, {
+                  ...modifiedInboxes.get(inbox.id),
+                  accountStatus: actionStatus,
+                  status: actionStatus,
+                  expiryNotified: true,
+                });
+                updatedInboxes[i] = {
+                  ...updatedInboxes[i],
+                  accountStatus: actionStatus,
+                  status: actionStatus,
+                  expiryNotified: true,
+                };
+                await clearStoredEmails(inbox.address).catch((err) =>
+                  logError('Failed to clear stored emails after renewal failure', err)
+                );
+              } catch {
+                /* non-critical */
+              }
+            } else {
+              notifyExpiredOnce();
+            }
             continue;
           }
         } else {
@@ -176,8 +261,27 @@ export async function checkInboxExpiry(): Promise<void> {
                 expiryNotified: true,
               };
             }
-          } catch {
-            /* keep expired state if storage fails */
+            await clearStoredEmails(inbox.address).catch((err) =>
+              logError('Failed to clear stored emails', err)
+            );
+          } catch (err) {
+            // Storage read failed — fall back to archive to prevent zombie expired state
+            logError('Failed to read expiryAction from storage, defaulting to archive', err);
+            modifiedInboxes.set(inbox.id, {
+              ...modifiedInboxes.get(inbox.id),
+              accountStatus: 'archived',
+              status: 'archived',
+              expiryNotified: true,
+            });
+            updatedInboxes[i] = {
+              ...updatedInboxes[i],
+              accountStatus: 'archived',
+              status: 'archived',
+              expiryNotified: true,
+            };
+            await clearStoredEmails(inbox.address).catch((e) =>
+              logError('Failed to clear stored emails', e)
+            );
           }
           continue;
         }
@@ -185,9 +289,13 @@ export async function checkInboxExpiry(): Promise<void> {
 
       const currentInboxState = updatedInboxes[i];
       const timeLeft = currentInboxState.expiresAt ? currentInboxState.expiresAt - now : null;
-      if (timeLeft && timeLeft <= warningThreshold && !currentInboxState.expiryNotified) {
+      if (timeLeft !== null && timeLeft <= warningThreshold && !currentInboxState.expiryNotified) {
         if (notificationSettings?.enabled) {
-          createInboxNotification('expiring-soon', currentInboxState.address);
+          createInboxNotification(
+            'expiring-soon',
+            currentInboxState.address,
+            notificationSettings.soundEnabled !== false
+          );
         }
         modifiedInboxes.set(currentInboxState.id, {
           ...modifiedInboxes.get(currentInboxState.id),
@@ -212,6 +320,18 @@ export async function checkInboxExpiry(): Promise<void> {
           }
         }
         if (changed) {
+          const MAX_ARCHIVED_INBOXES = 50;
+          const archived = currentInboxes.filter((inb) => inb.accountStatus === 'archived');
+          if (archived.length > MAX_ARCHIVED_INBOXES) {
+            let toRemove = archived.length - MAX_ARCHIVED_INBOXES;
+            for (let j = 0; j < currentInboxes.length && toRemove > 0; j++) {
+              if (currentInboxes[j].accountStatus === 'archived') {
+                currentInboxes.splice(j, 1);
+                j--;
+                toRemove--;
+              }
+            }
+          }
           await setInboxes(currentInboxes);
         }
       });
@@ -222,6 +342,8 @@ export async function checkInboxExpiry(): Promise<void> {
       undefined,
       error instanceof Error ? error : new Error(String(error))
     );
+  } finally {
+    expiryCheckRunning = false;
   }
 }
 

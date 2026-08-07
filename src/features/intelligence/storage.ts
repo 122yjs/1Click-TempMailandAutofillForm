@@ -20,15 +20,7 @@ const KEYS = {
   identityStickyByDomain: 'identityStickyByDomain',
 } as const;
 
-function normalizeDomain(d: string): string {
-  return (d || '')
-    .toLowerCase()
-    .replace(/^https?:\/\//, '')
-    .replace(/^www\./, '')
-    .split('/')[0]
-    .split('?')[0]
-    .trim();
-}
+import { normalizeDomain } from '@/utils/validation.js';
 
 export { normalizeDomain };
 
@@ -39,6 +31,7 @@ export async function loadSiteProfiles(): Promise<Record<string, SiteProfile>> {
     };
     return res.siteProfiles || {};
   } catch {
+    /* ignore */
     return {};
   }
 }
@@ -71,6 +64,7 @@ export async function loadProviderHealthMap(): Promise<Record<string, ProviderHe
     };
     return res.providerHealth || {};
   } catch {
+    /* ignore */
     return {};
   }
 }
@@ -91,6 +85,7 @@ export async function loadInboxLifecycleMap(): Promise<Record<string, InboxLifec
     };
     return res.inboxLifecycle || {};
   } catch {
+    /* ignore */
     return {};
   }
 }
@@ -108,6 +103,7 @@ export async function loadNotificationIntelligence(): Promise<NotificationIntell
     };
     return { ...DEFAULT_NOTIFICATION_INTELLIGENCE, ...(res.notificationIntelligence || {}) };
   } catch {
+    /* ignore */
     return { ...DEFAULT_NOTIFICATION_INTELLIGENCE };
   }
 }
@@ -125,6 +121,7 @@ export async function loadIdentityStickyMap(): Promise<Record<string, string>> {
     };
     return res.identityStickyByDomain || {};
   } catch {
+    /* ignore */
     return {};
   }
 }

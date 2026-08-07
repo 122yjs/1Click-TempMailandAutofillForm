@@ -1,7 +1,6 @@
 /**
  * Random data generators for form autofill
  */
-
 import {
   PASSWORD_MAX_LENGTH,
   PASSWORD_MIN_LENGTH,
@@ -13,14 +12,130 @@ import {
   PHONE_PART_MIN,
   USERNAME_MAX_LENGTH,
   USERNAME_MIN_LENGTH,
-} from '@/utils/constants.js';
-import {
-  randomChance,
-  randomInt,
-  randomIntBetween,
-  randomItem,
-  randomToken,
-} from '@/utils/secure-random.js';
+} from '@/utils/content-constants.js';
+import { randomInt, randomIntBetween, randomItem, randomToken } from '@/utils/secure-random.js';
+
+export function generateUsername(): string {
+  const adj = [
+    'swift',
+    'calm',
+    'bright',
+    'quiet',
+    'lucky',
+    'clever',
+    'happy',
+    'cool',
+    'vivid',
+    'noble',
+    'fresh',
+    'sunny',
+  ];
+  const noun = [
+    'otter',
+    'maple',
+    'river',
+    'cloud',
+    'pixel',
+    'cedar',
+    'falcon',
+    'comet',
+    'orchid',
+    'ember',
+    'nova',
+    'harbor',
+  ];
+  const a = randomItem(adj) || 'cool';
+  const n = randomItem(noun) || 'user';
+  const digits = String(randomIntBetween(10, 9999));
+  // Keep within common site limits (3–20)
+  let u = `${a}${n}${digits}`;
+  if (u.length > USERNAME_MAX_LENGTH) u = u.slice(0, USERNAME_MAX_LENGTH);
+  if (u.length < USERNAME_MIN_LENGTH) u = `${u}${randomIntBetween(10, 99)}`;
+  return u.toLowerCase().replace(/[^a-z0-9_]/g, '');
+}
+
+export function generatePhoneNumber(locale?: string): string {
+  // Try to use provided locale, or detect from navigator.language, defaulting to 'en-US'
+  const activeLocale = locale || (typeof navigator !== 'undefined' ? navigator.language : 'en-US');
+
+  if (activeLocale.startsWith('fr')) {
+    // French style: 06 12 34 56 78
+    return `06 ${String(randomIntBetween(10, 99))} ${String(randomIntBetween(10, 99))} ${String(randomIntBetween(10, 99))} ${String(randomIntBetween(10, 99))}`;
+  } else if (activeLocale.startsWith('de')) {
+    // German style: +49 170 1234567
+    return `+49 17${randomInt(10)} ${randomIntBetween(1000000, 9999999)}`;
+  } else if (activeLocale.startsWith('en-GB') || activeLocale.startsWith('en-UK')) {
+    // UK style: 07123 456789
+    return `07${randomIntBetween(100, 999)} ${randomIntBetween(100000, 999999)}`;
+  } else if (activeLocale.startsWith('ja')) {
+    // Japan style: 090-1234-5678
+    return `090-${randomIntBetween(1000, 9999)}-${randomIntBetween(1000, 9999)}`;
+  }
+
+  // Default to US format: XXX-XXX-XXXX
+  const areaCode = randomIntBetween(PHONE_AREA_CODE_MIN, PHONE_AREA_CODE_MAX);
+  const firstPart = randomIntBetween(PHONE_PART_MIN, PHONE_PART_MAX);
+  const secondPart = randomIntBetween(PHONE_LAST_PART_MIN, PHONE_LAST_PART_MAX);
+  return `${areaCode}-${firstPart}-${secondPart}`;
+}
+
+export function generateWebsiteUrl(): string {
+  const domains = ['com', 'net', 'org', 'io', 'co', 'ai', 'dev'];
+  const name = randomToken(10);
+  const domain = randomItem(domains) ?? 'com';
+  return `https://www.${name}.${domain}`;
+}
+
+export function generateRandomName(): string {
+  const firstNames = [
+    'James',
+    'John',
+    'Robert',
+    'Michael',
+    'William',
+    'David',
+    'Richard',
+    'Joseph',
+    'Thomas',
+    'Charles',
+    'Mary',
+    'Patricia',
+    'Jennifer',
+    'Linda',
+    'Elizabeth',
+    'Barbara',
+    'Susan',
+    'Jessica',
+    'Sarah',
+    'Karen',
+  ];
+  const lastNames = [
+    'Smith',
+    'Johnson',
+    'Williams',
+    'Brown',
+    'Jones',
+    'Garcia',
+    'Miller',
+    'Davis',
+    'Rodriguez',
+    'Martinez',
+    'Anderson',
+    'Taylor',
+    'Thomas',
+    'Moore',
+    'Jackson',
+    'Martin',
+    'Lee',
+    'Thompson',
+    'White',
+    'Harris',
+  ];
+
+  const firstName = randomItem(firstNames) ?? 'James';
+  const lastName = randomItem(lastNames) ?? 'Smith';
+  return `${firstName} ${lastName}`;
+}
 
 export interface PasswordRules {
   minLength: number;
@@ -37,7 +152,7 @@ const DEFAULT_SPECIAL = '!@#$%^&*()_+-=[]{}|;:,.<>?';
 /** Infer password rules from the input + nearby labels / minlength / pattern / text. */
 export function detectPasswordRules(
   field?: HTMLInputElement | null,
-  form?: HTMLFormElement | Document | null
+  form?: HTMLElement | Document | null
 ): PasswordRules {
   const rules: PasswordRules = {
     minLength: PASSWORD_MIN_LENGTH,
@@ -176,114 +291,12 @@ export function generatePassword(rules?: Partial<PasswordRules>): string {
 /** Smart password from a field context. */
 export function generateSmartPassword(
   field?: HTMLInputElement | null,
-  form?: HTMLFormElement | Document | null
+  form?: HTMLElement | Document | null
 ): string {
   return generatePassword(detectPasswordRules(field, form));
 }
 
-export function generateUsername(): string {
-  const letters = 'abcdefghijklmnopqrstuvwxyz';
-  const numbers = '0123456789';
-  const allChars = letters + numbers;
-  const length = randomIntBetween(USERNAME_MIN_LENGTH, USERNAME_MAX_LENGTH);
-  let username = '';
-
-  username += letters[randomInt(letters.length)];
-
-  for (let i = 1; i < length - 1; i++) {
-    if (i > 1 && username[i - 1] !== '-' && randomChance(0.1)) {
-      username += '-';
-    } else {
-      const useNumber = randomChance(0.3);
-      username += useNumber
-        ? numbers[randomInt(numbers.length)]
-        : letters[randomInt(letters.length)];
-    }
-  }
-
-  username += allChars[randomInt(allChars.length)];
-  return username;
-}
-
-export function generatePhoneNumber(locale?: string): string {
-  // Try to use provided locale, or detect from navigator.language, defaulting to 'en-US'
-  const activeLocale = locale || (typeof navigator !== 'undefined' ? navigator.language : 'en-US');
-
-  if (activeLocale.startsWith('fr')) {
-    // French style: 06 12 34 56 78
-    return `06 ${String(randomIntBetween(10, 99))} ${String(randomIntBetween(10, 99))} ${String(randomIntBetween(10, 99))} ${String(randomIntBetween(10, 99))}`;
-  } else if (activeLocale.startsWith('de')) {
-    // German style: +49 170 1234567
-    return `+49 17${randomInt(10)} ${randomIntBetween(1000000, 9999999)}`;
-  } else if (activeLocale.startsWith('en-GB') || activeLocale.startsWith('en-UK')) {
-    // UK style: 07123 456789
-    return `07${randomIntBetween(100, 999)} ${randomIntBetween(100000, 999999)}`;
-  } else if (activeLocale.startsWith('ja')) {
-    // Japan style: 090-1234-5678
-    return `090-${randomIntBetween(1000, 9999)}-${randomIntBetween(1000, 9999)}`;
-  }
-
-  // Default to US format: XXX-XXX-XXXX
-  const areaCode = randomIntBetween(PHONE_AREA_CODE_MIN, PHONE_AREA_CODE_MAX);
-  const firstPart = randomIntBetween(PHONE_PART_MIN, PHONE_PART_MAX);
-  const secondPart = randomIntBetween(PHONE_LAST_PART_MIN, PHONE_LAST_PART_MAX);
-  return `${areaCode}-${firstPart}-${secondPart}`;
-}
-
-export function generateWebsiteUrl(): string {
-  const domains = ['com', 'net', 'org', 'io', 'co', 'ai', 'dev'];
-  const name = randomToken(10);
-  const domain = randomItem(domains) ?? 'com';
-  return `https://www.${name}.${domain}`;
-}
-
-export function generateRandomName(): string {
-  const firstNames = [
-    'James',
-    'John',
-    'Robert',
-    'Michael',
-    'William',
-    'David',
-    'Richard',
-    'Joseph',
-    'Thomas',
-    'Charles',
-    'Mary',
-    'Patricia',
-    'Jennifer',
-    'Linda',
-    'Elizabeth',
-    'Barbara',
-    'Susan',
-    'Jessica',
-    'Sarah',
-    'Karen',
-  ];
-  const lastNames = [
-    'Smith',
-    'Johnson',
-    'Williams',
-    'Brown',
-    'Jones',
-    'Garcia',
-    'Miller',
-    'Davis',
-    'Rodriguez',
-    'Martinez',
-    'Anderson',
-    'Taylor',
-    'Thomas',
-    'Moore',
-    'Jackson',
-    'Martin',
-    'Lee',
-    'Thompson',
-    'White',
-    'Harris',
-  ];
-
-  const firstName = randomItem(firstNames) ?? 'James';
-  const lastName = randomItem(lastNames) ?? 'Smith';
-  return `${firstName} ${lastName}`;
-}
+/**
+ * Human-readable username (not password-like).
+ * Pattern: word + word + 2–4 digits, no special chars.
+ */

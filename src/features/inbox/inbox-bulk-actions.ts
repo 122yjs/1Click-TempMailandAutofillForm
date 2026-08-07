@@ -2,6 +2,7 @@ import type { Browser } from 'wxt/browser';
 import { t } from '@/utils/i18n-utils.js';
 import { logError } from '@/utils/logger.js';
 import { withInboxLock } from '@/utils/mutex.js';
+import { getInboxes, setInboxes } from '@/utils/storage-keys.js';
 import type { Account, Email } from '@/utils/types.js';
 import { canUnarchive } from './inbox-management.js';
 
@@ -41,7 +42,7 @@ export function toggleSelect(selectedAddresses: Set<string>, id: string): Set<st
 }
 
 export async function archiveSelected(
-  ext: Browser,
+  _ext: Browser,
   state: BulkActionsState,
   setters: BulkActionsSetters
 ) {
@@ -49,26 +50,24 @@ export async function archiveSelected(
     const count = state.selectedAddresses.size;
     let archivedInboxes: Account[] = [];
     await withInboxLock(async () => {
-      const result = (await ext.storage.local.get(['inboxes'])) as { inboxes?: Account[] };
-      const inboxes = result.inboxes || [];
+      const inboxes = await getInboxes();
       archivedInboxes = inboxes.filter((i: Account) => state.selectedAddresses.has(i.id));
       const updated = inboxes.map((i) =>
         state.selectedAddresses.has(i.id) ? { ...i, accountStatus: 'archived' as const } : i
       );
-      await ext.storage.local.set({ inboxes: updated });
+      await setInboxes(updated);
     });
     await setters.loadInboxes();
     setters.setSelectedAddresses(new Set());
     setters.setShowToast(await t('toasts.emailsArchivedCount', { count }), 'success', async () => {
       // Undo: restore archived inboxes
       await withInboxLock(async () => {
-        const currentResult = (await ext.storage.local.get(['inboxes'])) as { inboxes?: Account[] };
-        const currentInboxes = currentResult.inboxes || [];
+        const currentInboxes = await getInboxes();
         const restored = currentInboxes.map((i: Account) => {
           const wasArchived = archivedInboxes.find((a) => a.id === i.id);
           return wasArchived ? { ...i, accountStatus: 'active' as const } : i;
         });
-        await ext.storage.local.set({ inboxes: restored });
+        await setInboxes(restored);
       });
       await setters.loadInboxes();
       setters.setShowToast(await t('toasts.archiveUndone'));
@@ -80,7 +79,7 @@ export async function archiveSelected(
 }
 
 export async function unarchiveSelected(
-  ext: Browser,
+  _ext: Browser,
   state: BulkActionsState,
   setters: BulkActionsSetters
 ) {
@@ -92,8 +91,7 @@ export async function unarchiveSelected(
     let warningCount = 0;
 
     await withInboxLock(async () => {
-      const result = (await ext.storage.local.get(['inboxes'])) as { inboxes?: Account[] };
-      const inboxes = result.inboxes || [];
+      const inboxes = await getInboxes();
 
       // Filter out expired emails that cannot be unarchived
       const canUnarchiveIds = new Set<string>();
@@ -117,7 +115,7 @@ export async function unarchiveSelected(
       const updated = inboxes.map((i) =>
         canUnarchiveIds.has(i.id) ? { ...i, accountStatus: 'active' as const } : i
       );
-      await ext.storage.local.set({ inboxes: updated });
+      await setInboxes(updated);
       actualUnarchivedCount = canUnarchiveIds.size;
     });
 
@@ -173,35 +171,57 @@ export async function deleteSelected(
         seenEmailIds?: Record<string, string[]>;
         lastMessageTimestamps?: Record<string, number>;
       };
-      const deletedInboxes = (storageSnapshot.inboxes || []).filter((inbox) =>
-        state.selectedAddresses.has(inbox.id)
-      );
-
+      // Transactional delete: attempt every selected id, collect per-id
+      // results so a mid-loop failure doesn't leave a half-deleted state with
+      // no undo path for the ones that actually succeeded.
+      const totalCount = state.selectedAddresses.size;
+      const succeededIds: string[] = [];
+      let failedCount = 0;
       for (const id of state.selectedAddresses) {
-        const result = await ext.runtime.sendMessage({
-          type: 'deleteInbox',
-          inboxId: id,
-          preserveEmails: false,
-        });
-        if (!result?.success) {
-          throw new Error(result?.error || `Failed to delete inbox ${id}`);
+        try {
+          const result = await ext.runtime.sendMessage({
+            type: 'deleteInbox',
+            inboxId: id,
+            preserveEmails: false,
+          });
+          if (result?.success) {
+            succeededIds.push(id);
+          } else {
+            failedCount++;
+          }
+        } catch {
+          /* ignore */
+          failedCount++;
         }
       }
+      // Only the inboxes actually deleted server-side are eligible for undo.
+      const deletedInboxes = (storageSnapshot.inboxes || []).filter((inbox) =>
+        succeededIds.includes(inbox.id)
+      );
       await setters.loadInboxes();
+
+      if (succeededIds.length === 0) {
+        setters.setShowToast(await t('toasts.deleteFailed'), 'error');
+        return;
+      }
       setters.setShowToast(
-        await t('toasts.inboxesDeletedCount', { count }),
+        await t('toasts.inboxesDeletedCount', { count: succeededIds.length }),
         'success',
         async () => {
           const current = (await ext.storage.local.get([
             'inboxes',
             'storedEmails',
             'archivedEmails',
+            'readEmails',
+            'starredEmails',
             'seenEmailIds',
             'lastMessageTimestamps',
           ])) as {
             inboxes?: Account[];
             storedEmails?: Record<string, Email[]>;
             archivedEmails?: Record<string, Email[]>;
+            readEmails?: Record<string, boolean>;
+            starredEmails?: string[];
             seenEmailIds?: Record<string, string[]>;
             lastMessageTimestamps?: Record<string, number>;
           };
@@ -233,12 +253,41 @@ export async function deleteSelected(
             }
           }
 
+          // Merge read/star state per-id: restore the deleted inboxes' snapshot
+          // entries WITHOUT clobbering read/star changes that happened in other
+          // (non-deleted) inboxes between the delete and the undo.
+          const readEmails = { ...(current.readEmails || {}) };
+          if (storageSnapshot.readEmails) {
+            // Build the set of read-state keys that belong to the deleted inboxes:
+            // compound keys `${address}_${id}` for each deleted address, plus the
+            // bare ids of the emails stored in those deleted inboxes.
+            const deletedReadKeys = new Set<string>();
+            for (const inbox of deletedInboxes) {
+              const prefix = `${inbox.address}_`;
+              for (const key of Object.keys(storageSnapshot.readEmails)) {
+                if (key.startsWith(prefix)) deletedReadKeys.add(key);
+              }
+              for (const email of storageSnapshot.storedEmails?.[inbox.address] || []) {
+                deletedReadKeys.add(email.id);
+              }
+            }
+            for (const [k, v] of Object.entries(storageSnapshot.readEmails)) {
+              if (deletedReadKeys.has(k)) readEmails[k] = v;
+            }
+          }
+          const starredEmails = [
+            ...new Set([
+              ...(current.starredEmails || []),
+              ...(storageSnapshot.starredEmails || []),
+            ]),
+          ];
+
           await ext.storage.local.set({
             inboxes: restoredInboxes,
             storedEmails,
             archivedEmails,
-            readEmails: storageSnapshot.readEmails || {},
-            starredEmails: storageSnapshot.starredEmails || [],
+            readEmails,
+            starredEmails,
             seenEmailIds,
             lastMessageTimestamps,
           });
@@ -248,6 +297,13 @@ export async function deleteSelected(
       );
       setters.setSelectedAddresses(new Set());
       setters.closeConfirm();
+
+      if (failedCount > 0) {
+        setters.setShowToast(
+          await t('toasts.deletePartialFailed', { failed: failedCount, total: totalCount }),
+          'warning'
+        );
+      }
     } catch (e) {
       logError('Bulk deletion of selected inboxes failed', e);
       setters.setShowToast(await t('toasts.deleteFailed'), 'error');
@@ -258,10 +314,12 @@ export async function deleteSelected(
 export async function exportSelected(
   accounts: Account[],
   selectedAddresses: Set<string>,
-  exportAccountEmails: (account: Account) => Promise<void>
+  exportAccountEmails: (account: Account | Account[]) => Promise<void>
 ) {
-  for (const id of selectedAddresses) {
-    const acct = accounts.find((a) => a.id === id);
-    if (acct) await exportAccountEmails(acct);
+  const selectedList = accounts.filter((a) => selectedAddresses.has(a.id));
+  if (selectedList.length === 1) {
+    await exportAccountEmails(selectedList[0]);
+  } else if (selectedList.length > 1) {
+    await exportAccountEmails(selectedList);
   }
 }

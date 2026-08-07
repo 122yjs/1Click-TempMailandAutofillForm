@@ -26,4 +26,4 @@ export const PRODUCT_TOUR_STORAGE_KEY = 'productTourCompleted';
 export const PRODUCT_TOUR_PENDING_KEY = 'pendingProductTour';
 export const PRODUCT_TOUR_VERSION_KEY = 'productTourVersion';
 /** Bump when tour steps change so returning users can optionally re-see it. */
-export const PRODUCT_TOUR_VERSION = 2;
+export const PRODUCT_TOUR_VERSION = 3;

@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import { evaluateFit, fillPlaceholders, measureTextWidth } from '@/utils/i18n-fit-metrics';
-import { flattenLocale, scanLocaleFit } from '@/utils/i18n-fit-scan';
+import {
+  evaluateFit,
+  fillPlaceholders,
+  measureTextWidth,
+} from '../../../scripts/i18n-fit/i18n-fit-metrics';
+import { flattenLocale, scanLocaleFit } from '../../../scripts/i18n-fit/i18n-fit-scan';
 
 describe('measureTextWidth', () => {
   test('empty is 0', () => {

@@ -1,6 +1,6 @@
 import { browser } from 'wxt/browser';
 import { defineContentScript } from 'wxt/utils/define-content-script';
-import { inferPlatformFromUA } from '@/utils/user-agent.js';
+import { inferPlatformFromUA, isSafeUserAgentString } from '@/utils/user-agent.js';
 
 export default defineContentScript({
   matches: ['<all_urls>'],
@@ -17,7 +17,7 @@ export default defineContentScript({
         );
         const customUA = activeIdentity?.userAgent;
 
-        if (!customUA) return;
+        if (!customUA || !isSafeUserAgentString(customUA)) return;
 
         const platform = inferPlatformFromUA(customUA);
 

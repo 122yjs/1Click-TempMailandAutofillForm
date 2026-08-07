@@ -1,4 +1,4 @@
-import type { Toast, ToastType } from '@/components/feedback/Toast.svelte';
+import type { Toast, ToastType } from '@/ui/blocks/feedback/Toast.svelte';
 
 class ToastStore {
   private toasts: Toast[] = [];
@@ -7,6 +7,8 @@ class ToastStore {
   private lastMessage = '';
   private lastMessageAt = 0;
   private static DEDUPE_MS = 1800;
+  /** Master switch — when off, push() is a no-op and visible toasts clear. */
+  private enabled = true;
 
   subscribe(listener: (toasts: Toast[]) => void) {
     this.listeners.add(listener);
@@ -20,6 +22,12 @@ class ToastStore {
     });
   }
 
+  setEnabled(enabled: boolean) {
+    if (this.enabled === enabled) return;
+    this.enabled = enabled;
+    if (!enabled) this.clear(); // dismiss any toasts already on screen
+  }
+
   add(
     type: ToastType,
     message: string,
@@ -27,6 +35,7 @@ class ToastStore {
     undoAction?: (() => void | Promise<void>) | null,
     actionLabel?: string | null
   ) {
+    if (!this.enabled) return '';
     const now = Date.now();
     const normalized = (message || '').trim();
     // Collapse duplicate toasts fired in a short window (copy spam, etc.)

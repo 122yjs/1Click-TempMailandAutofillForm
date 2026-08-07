@@ -159,6 +159,38 @@ Configuration for cache-busting and forcing new sessions:
 }
 ```
 
+## Raw Source Retrieval (optional)
+
+Some providers serve a server-filtered `mail_body` (stripped `<style>`/`@media`,
+rewritten image URLs) but expose the untouched raw MIME source via a separate
+operation. Configure `emailFetching.rawSource` to fetch it per message and store
+it on `Email.raw_source` — rendering then prefers the original HTML part and
+`.eml` export emits the raw source verbatim.
+
+```json
+{
+  "emailFetching": {
+    "type": "multi_step",
+    "detailOperation": "fetchEmail",
+    "detailItemIdParam": "email_id",
+    "rawSource": {
+      "operation": "getEmailSource",
+      "itemIdParam": "email_id",
+      "sourcePath": "source"
+    }
+  }
+}
+```
+
+- `operation` - name of the `operations` entry that returns the raw source
+- `itemIdParam` - context variable carrying the message id (same template
+  variable used by the detail fetch, e.g. `{email_id}`)
+- `sourcePath` - dot-notation path of the raw source string in the response
+
+The raw-source call is best-effort: on failure the message still stores with the
+provider's filtered `body_html`. Nothing in the DSL is provider-specific — all
+values come from `providers.jsonc`.
+
 ## Error Handling
 
 Configuration for error detection:

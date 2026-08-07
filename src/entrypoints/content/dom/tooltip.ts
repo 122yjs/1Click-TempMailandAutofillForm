@@ -1,4 +1,5 @@
-import { TOAST_DEFAULT_DURATION_MS } from '@/utils/constants.js';
+import { TOAST_DEFAULT_DURATION_MS } from '@/utils/content-constants.js';
+import { CONTENT_Z } from '@/utils/portal-layers.js';
 import { getOrCreateShadowRoot } from './shadow-dom.js';
 
 function hostRoot(): ShadowRoot | HTMLElement {
@@ -20,7 +21,7 @@ export async function showTooltip(
     padding: 8px 12px;
     border-radius: 4px;
     font-size: 14px;
-    z-index: 10001;
+    z-index: ${CONTENT_Z.tooltip};
     max-width: 250px;
     box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
     transition: opacity 0.3s;
@@ -57,7 +58,7 @@ export function showConflictChip(anchor: HTMLElement, message: string, durationM
   chip.textContent = message;
   chip.style.cssText = `
     position: fixed;
-    z-index: 10002;
+    z-index: ${CONTENT_Z.tooltip};
     max-width: min(320px, calc(100vw - 16px));
     padding: 8px 12px;
     border-radius: 999px;
@@ -95,7 +96,7 @@ export function showFillMicroStatus(anchor: HTMLElement, text: string, durationM
   bar.textContent = text;
   bar.style.cssText = `
     position: fixed;
-    z-index: 10002;
+    z-index: ${CONTENT_Z.tooltip};
     max-width: min(360px, calc(100vw - 16px));
     padding: 8px 12px;
     border-radius: 10px;

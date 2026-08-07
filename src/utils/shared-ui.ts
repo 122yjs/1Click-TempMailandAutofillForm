@@ -1,4 +1,4 @@
-import type { ToastType } from '@/components/feedback/Toast.svelte';
+import type { ToastType } from '@/ui/blocks/feedback/Toast.svelte';
 import { detectIconFromMessage } from '@/utils/iconMapping.js';
 
 /**
