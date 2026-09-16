@@ -1,0 +1,19 @@
+{
+  "worktree": {
+    "setup": "bun install",
+    "teardown": "rm -rf .wxt || true"
+  },
+  "scripts": {
+    "test": {
+      "command": "bun test"
+    },
+    "check": {
+      "command": "bun run check"
+    },
+    "dev": {
+      "type": "service",
+      "command": "bun run dev",
+      "port": 3000
+    }
+  }
+}
